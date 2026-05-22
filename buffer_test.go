@@ -1,27 +1,42 @@
 package pool
 
 import (
+	"io"
 	"net"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 )
 
 // mockConn implements net.Conn for testing
 type mockConn struct {
+	mu         sync.Mutex
 	closed     bool
 	localAddr  net.Addr
 	remoteAddr net.Addr
 }
 
-func (m *mockConn) Read(b []byte) (n int, err error)   { return 0, nil }
-func (m *mockConn) Write(b []byte) (n int, err error)  { return len(b), nil }
-func (m *mockConn) Close() error                       { m.closed = true; return nil }
+func (m *mockConn) Read(b []byte) (n int, err error)  { return 0, io.EOF }
+func (m *mockConn) Write(b []byte) (n int, err error) { return len(b), nil }
+func (m *mockConn) Close() error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.closed = true
+	return nil
+}
 func (m *mockConn) LocalAddr() net.Addr                { return m.localAddr }
 func (m *mockConn) RemoteAddr() net.Addr               { return m.remoteAddr }
 func (m *mockConn) SetDeadline(t time.Time) error      { return nil }
 func (m *mockConn) SetReadDeadline(t time.Time) error  { return nil }
 func (m *mockConn) SetWriteDeadline(t time.Time) error { return nil }
+
+// IsClosed returns whether the connection is closed (thread-safe)
+func (m *mockConn) IsClosed() bool {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.closed
+}
 
 // mockAddr implements net.Addr for testing
 type mockAddr struct {
@@ -174,8 +189,11 @@ func TestConnPool_MaxSize(t *testing.T) {
 
 	// Second connection should be rejected (exceeds max size)
 	err2 := pool.Put(conn2)
-	if err2 != nil {
-		t.Fatalf("Second Put failed: %v", err2)
+	if err2 == nil {
+		t.Fatal("Second Put should fail when pool is at capacity")
+	}
+	if !strings.Contains(err2.Error(), "pool at capacity") && !strings.Contains(err2.Error(), "POOL_FULL") {
+		t.Errorf("Expected pool capacity error, got: %v", err2)
 	}
 
 	// Should only have one connection available
@@ -185,7 +203,7 @@ func TestConnPool_MaxSize(t *testing.T) {
 	}
 
 	// Verify conn2 was closed due to max size limit
-	if !conn2.closed {
+	if !conn2.IsClosed() {
 		t.Error("Connection should be closed when exceeding max size")
 	}
 }
@@ -246,7 +264,7 @@ func TestConnPool_Close(t *testing.T) {
 	}
 
 	// Verify connection was closed
-	if !conn1.closed {
+	if !conn1.IsClosed() {
 		t.Error("Connection should be closed when pool is closed")
 	}
 
@@ -263,12 +281,15 @@ func TestConnPool_Close(t *testing.T) {
 
 	conn2 := newMockConn("127.0.0.1:9090")
 	err = pool.Put(conn2)
-	if err != nil {
-		t.Fatalf("Put after close failed: %v", err)
+	if err == nil {
+		t.Fatal("Put after close should fail")
+	}
+	if !strings.Contains(err.Error(), "pool is closed") && !strings.Contains(err.Error(), "POOL_CLOSED") {
+		t.Errorf("Expected pool closed error, got: %v", err)
 	}
 
 	// Verify conn2 was closed immediately
-	if !conn2.closed {
+	if !conn2.IsClosed() {
 		t.Error("Connection should be closed immediately when put in closed pool")
 	}
 }
@@ -359,7 +380,7 @@ func TestPerformCleanupCycle_ExpiresOldConnections(t *testing.T) {
 		t.Errorf("Expected 0 connections after cleanup, got %d", stats["total"])
 	}
 
-	if !conn.closed {
+	if !conn.IsClosed() {
 		t.Error("Expired connection should be closed")
 	}
 }
@@ -399,13 +420,13 @@ func TestFilterValidConnections(t *testing.T) {
 		created:  time.Now(),
 		lastUsed: time.Now(),
 	}
-	expired := &PooledConn{
+	expiredConn := &PooledConn{
 		conn:     newMockConn("127.0.0.1:8081"),
 		created:  time.Now().Add(-time.Hour),
 		lastUsed: time.Now().Add(-time.Hour),
 	}
 
-	result := pool.filterValidConnections([]*PooledConn{fresh, expired})
+	result, expiredList := pool.filterValidConnections([]*PooledConn{fresh, expiredConn})
 
 	if len(result) != 1 {
 		t.Fatalf("Expected 1 valid connection, got %d", len(result))
@@ -413,8 +434,11 @@ func TestFilterValidConnections(t *testing.T) {
 	if result[0] != fresh {
 		t.Error("Expected the fresh connection to survive")
 	}
-	if !expired.conn.(*mockConn).closed {
-		t.Error("Expired connection should be closed")
+	if len(expiredList) != 1 {
+		t.Fatalf("Expected 1 expired connection, got %d", len(expiredList))
+	}
+	if expiredList[0] != expiredConn {
+		t.Error("Expected the expired connection to be marked for closure")
 	}
 }
 
@@ -451,20 +475,6 @@ func TestShouldKeepConnection(t *testing.T) {
 	}
 	if pool.shouldKeepConnection(expired) {
 		t.Error("Expired idle connection should not be kept")
-	}
-}
-
-func TestCloseExpiredConnection(t *testing.T) {
-	pool := NewConnPool(nil)
-	defer pool.Close()
-
-	conn := newMockConn("127.0.0.1:8080")
-	pooledConn := &PooledConn{conn: conn}
-
-	pool.closeExpiredConnection(pooledConn)
-
-	if !conn.closed {
-		t.Error("closeExpiredConnection should close the connection")
 	}
 }
 
@@ -539,7 +549,7 @@ func TestRelease_ClosedPool_ClosesConnection(t *testing.T) {
 	if err != nil {
 		t.Errorf("Release on closed pool should not error: %v", err)
 	}
-	if !conn2.closed {
+	if !conn2.IsClosed() {
 		t.Error("Connection should be closed when released to a closed pool")
 	}
 }
@@ -571,7 +581,7 @@ func TestPoolConnWrapper_Discard(t *testing.T) {
 		t.Fatalf("Discard failed: %v", err)
 	}
 
-	if !conn.closed {
+	if !conn.IsClosed() {
 		t.Error("Discarded connection should be closed")
 	}
 
@@ -602,10 +612,10 @@ func TestClose_SkipsInUseConnections(t *testing.T) {
 
 	pool.Close()
 
-	if !idle.closed {
+	if !idle.IsClosed() {
 		t.Error("Idle connection should be closed on pool.Close()")
 	}
-	if inUse.closed {
+	if inUse.IsClosed() {
 		t.Error("In-use connection should NOT be closed by pool.Close()")
 	}
 
@@ -614,7 +624,7 @@ func TestClose_SkipsInUseConnections(t *testing.T) {
 	if err != nil {
 		t.Errorf("Close on returned wrapper should not error: %v", err)
 	}
-	if !inUse.closed {
+	if !inUse.IsClosed() {
 		t.Error("In-use connection should be closed after release to closed pool")
 	}
 }
@@ -686,7 +696,7 @@ func TestMaxTotal_EnforcesGlobalLimit(t *testing.T) {
 	if stats["total"] != 2 {
 		t.Errorf("Expected 2 connections (MaxTotal=2), got total=%d", stats["total"])
 	}
-	if !conn3.closed {
+	if !conn3.IsClosed() {
 		t.Error("Third connection should be closed due to MaxTotal limit")
 	}
 }
@@ -712,7 +722,7 @@ func TestHealthCheck_RejectsUnhealthyConnections(t *testing.T) {
 		t.Error("Get should return nil when health check fails")
 	}
 
-	if !unhealthyConn.closed {
+	if !unhealthyConn.IsClosed() {
 		t.Error("Unhealthy connection should be closed and removed")
 	}
 
@@ -756,7 +766,7 @@ func TestGet_RemovesExpiredConnections(t *testing.T) {
 
 	// All expired connections must have been closed by Get().
 	for i, c := range expiredConns {
-		if !c.closed {
+		if !c.IsClosed() {
 			t.Errorf("expired conn[%d] was not closed by Get()", i)
 		}
 	}
@@ -789,7 +799,7 @@ func TestMaxSizeZero_TreatedAsNoLimit(t *testing.T) {
 		if err := p.Put(conns[i]); err != nil {
 			t.Fatalf("Put[%d] failed with MaxSize=0: %v", i, err)
 		}
-		if conns[i].closed {
+		if conns[i].IsClosed() {
 			t.Errorf("Put[%d] closed the connection with MaxSize=0", i)
 		}
 	}
@@ -931,7 +941,7 @@ func TestRemove_ConnectionNotInList(t *testing.T) {
 	}
 
 	// conn2 should still be closed to prevent resource leaks.
-	if !conn2.closed {
+	if !conn2.IsClosed() {
 		t.Error("connection should be closed even when not found in pool")
 	}
 
@@ -957,7 +967,7 @@ func TestRemove_AddressNotInPool(t *testing.T) {
 	if err == nil {
 		t.Fatal("Remove should return an error when address is not in the pool")
 	}
-	if !conn.closed {
+	if !conn.IsClosed() {
 		t.Error("connection should be closed even when address not in pool")
 	}
 }
@@ -1023,7 +1033,7 @@ func TestCleanup_TickerFires(t *testing.T) {
 	if stats["total"] != 0 {
 		t.Errorf("expected 0 connections after cleanup ticker fired, got %d", stats["total"])
 	}
-	if !conn.closed {
+	if !conn.IsClosed() {
 		t.Error("expired connection should have been closed by cleanup goroutine")
 	}
 }
@@ -1049,7 +1059,78 @@ func TestRemove_ClosedPool(t *testing.T) {
 	if err := p.Remove("10.0.0.9:1234", conn2); err != nil {
 		t.Errorf("Remove on closed pool should not error, got: %v", err)
 	}
-	if !conn2.closed {
+	if !conn2.IsClosed() {
 		t.Error("Remove on closed pool should close the supplied connection")
 	}
+}
+
+// TestRelease_AddressNeverInPool covers L-8: the CONNECTION_NOT_FOUND path
+// when Release is called with an address that was never added to the pool.
+func TestRelease_AddressNeverInPool(t *testing.T) {
+	p := NewConnPool(&PoolConfig{
+		MaxSize: 5,
+		MaxAge:  time.Hour,
+		MaxIdle: time.Hour,
+	})
+	defer p.Close()
+
+	conn := newMockConn("10.0.0.99:9999")
+	err := p.Release("10.0.0.99:9999", conn)
+	if err == nil {
+		t.Fatal("Release with address never in pool should return error")
+	}
+	// Check the error message contains "not found" rather than checking the code
+	if !strings.Contains(err.Error(), "not found") {
+		t.Errorf("Expected 'not found' in error, got: %v", err)
+	}
+}
+
+// TestRemove_AddressNeverInPoolExplicit covers L-8: the ADDRESS_NOT_FOUND path
+// when Remove is called with an address that was never added to the pool.
+func TestRemove_AddressNeverInPoolExplicit(t *testing.T) {
+	p := NewConnPool(&PoolConfig{
+		MaxSize: 5,
+		MaxAge:  time.Hour,
+		MaxIdle: time.Hour,
+	})
+	defer p.Close()
+
+	conn := newMockConn("10.0.0.98:9998")
+	err := p.Remove("10.0.0.98:9998", conn)
+	if err == nil {
+		t.Fatal("Remove with address never in pool should return error")
+	}
+	// Remove closes the connection even when returning an error
+	if !conn.IsClosed() {
+		t.Error("Remove should close the connection even when address not found")
+	}
+}
+
+// TestCleanup_TickerFiresThenClosed covers L-7: the shouldStopCleanup branch
+// triggered by the ticker case (not the done channel). We close the pool
+// shortly after a cleanup tick is expected, forcing the cleanup goroutine
+// to observe p.closed == true inside the ticker.C case.
+func TestCleanup_TickerFiresThenClosed(t *testing.T) {
+	p := NewConnPool(&PoolConfig{
+		MaxSize: 5,
+		MaxAge:  100 * time.Millisecond,
+		MaxIdle: 50 * time.Millisecond,
+	})
+
+	// Add a connection so cleanup has something to check
+	conn := newMockConn("10.0.0.1:8080")
+	if err := p.Put(conn); err != nil {
+		t.Fatalf("Put failed: %v", err)
+	}
+
+	// Wait for at least one cleanup cycle to fire
+	time.Sleep(60 * time.Millisecond)
+
+	// Close the pool - cleanup goroutine should exit via ticker.C case
+	p.Close()
+
+	// Give cleanup goroutine time to observe p.closed and exit
+	time.Sleep(100 * time.Millisecond)
+
+	// No data race or panic means the test passed
 }

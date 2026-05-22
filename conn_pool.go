@@ -64,6 +64,16 @@ type Pool interface {
 	Put(conn net.Conn) error
 	// GetOrDial retrieves an idle connection for remoteAddr or dials a new one.
 	GetOrDial(ctx context.Context, remoteAddr string, dial func(context.Context) (net.Conn, error)) (net.Conn, error)
+	// Release marks a connection as available for reuse without closing it.
+	Release(addr string, conn net.Conn) error
+	// Remove removes a connection from the pool and closes it.
+	Remove(addr string, conn net.Conn) error
+	// Drain waits for all in-use connections to be returned, up to the context deadline.
+	Drain(ctx context.Context) error
+	// Snapshot returns a shallow copy of the current pool state for inspection.
+	Snapshot() []*PooledConn
+	// Stats returns pool statistics (total connections, in-use count, etc.).
+	Stats() map[string]int
 	// Close closes the pool and all connections it holds.
 	Close() error
 }
@@ -121,46 +131,80 @@ func NewConnPool(config *PoolConfig) *ConnPool {
 // Get retrieves a connection from the pool for the given remote address.
 // Returns nil if no suitable connection is available.
 func (p *ConnPool) Get(remoteAddr string) net.Conn {
-	p.mu.Lock()
-	defer p.mu.Unlock()
+	var candidate *PooledConn
+	var toClose []*PooledConn
 
+	p.mu.Lock()
 	if p.closed {
+		p.mu.Unlock()
 		log.WithFields(logger.Fields{"pkg": "pool", "func": "ConnPool.Get"}).Debug("Get called on closed pool")
 		return nil
 	}
 
 	connList, exists := p.conns[remoteAddr]
 	if !exists || len(connList) == 0 {
+		p.mu.Unlock()
 		return nil
 	}
 
-	// Find an available, valid, and healthy connection.
-	// Expired connections are closed and removed here to prevent them from
-	// accumulating and inflating the count against maxSize (starvation fix).
+	// Find an available and valid connection.
+	// Expired connections are collected for closing outside the lock.
 	for i := 0; i < len(connList); i++ {
 		pooledConn := connList[i]
 		if pooledConn.inUse {
 			continue
 		}
 		if !p.isValid(pooledConn) {
-			// Remove expired connection immediately so it does not count against capacity.
-			pooledConn.conn.Close()
+			// Collect for closing outside the lock
+			toClose = append(toClose, pooledConn)
 			connList = append(connList[:i], connList[i+1:]...)
 			i--
 			p.updateConnectionMap(remoteAddr, connList)
 			continue
 		}
-		if p.healthCheck != nil && !p.healthCheck(pooledConn.conn) {
-			pooledConn.conn.Close()
-			connList = append(connList[:i], connList[i+1:]...)
-			i--
-			p.updateConnectionMap(remoteAddr, connList)
-			continue
+		// Found a valid candidate. Mark as tentatively in-use and break.
+		candidate = pooledConn
+		candidate.inUse = true
+		candidate.lastUsed = time.Now()
+		break
+	}
+	p.mu.Unlock()
+
+	// Close expired connections outside the lock
+	for _, pc := range toClose {
+		if err := pc.conn.Close(); err != nil {
+			log.WithFields(logger.Fields{
+				"pkg": "pool", "func": "ConnPool.Get",
+				"remote_addr": pc.remoteAddr,
+			}).Warnf("failed to close expired connection: %v", err)
 		}
-		pooledConn.inUse = true
-		pooledConn.lastUsed = time.Now()
+	}
+
+	// Run health check outside the lock if we have a candidate
+	if candidate != nil {
+		if p.healthCheck != nil && !p.healthCheck(candidate.conn) {
+			// Health check failed. Re-acquire lock, mark as not in-use, and remove.
+			if err := candidate.conn.Close(); err != nil {
+				log.WithFields(logger.Fields{
+					"pkg": "pool", "func": "ConnPool.Get",
+					"remote_addr": candidate.remoteAddr,
+				}).Warnf("failed to close unhealthy connection: %v", err)
+			}
+			p.mu.Lock()
+			connList := p.conns[remoteAddr]
+			for i, pc := range connList {
+				if pc == candidate {
+					connList = append(connList[:i], connList[i+1:]...)
+					p.updateConnectionMap(remoteAddr, connList)
+					break
+				}
+			}
+			p.mu.Unlock()
+			return nil
+		}
+		// Health check passed (or no health check configured)
 		return &PoolConnWrapper{
-			Conn: pooledConn.conn,
+			Conn: candidate.conn,
 			pool: p,
 			addr: remoteAddr,
 		}
@@ -198,23 +242,37 @@ func (p *ConnPool) GetOrDial(ctx context.Context, remoteAddr string, dial func(c
 	// Serialize dialing per address to prevent duplicate sessions.
 	addrMu := p.getOrDialMu(remoteAddr)
 	addrMu.Lock()
-	defer addrMu.Unlock()
 
 	// Re-check after acquiring the per-address lock — another goroutine
 	// may have dialed and put a connection while we waited.
 	if conn := p.Get(remoteAddr); conn != nil {
+		addrMu.Unlock()
 		return conn, nil
 	}
 
 	// Check context before dialing.
 	if err := ctx.Err(); err != nil {
+		addrMu.Unlock()
 		return nil, err
 	}
 
 	// Dial outside the pool lock.
 	log.WithFields(logger.Fields{"pkg": "pool", "func": "ConnPool.dialNew", "remote_addr": remoteAddr}).Debug("Dialing new connection for pool")
 	conn, err := dial(ctx)
+
+	// Release addrMu immediately after dial completes, before ReadyCheck.
+	// This allows other goroutines to proceed without waiting for our
+	// potentially-slow ReadyCheck callback.
+	addrMu.Unlock()
+
 	if err != nil {
+		// Clean up dialMu entry if no connections exist for this address
+		p.mu.Lock()
+		connList := p.conns[remoteAddr]
+		if len(connList) == 0 {
+			p.dialMu.Delete(remoteAddr)
+		}
+		p.mu.Unlock()
 		return nil, oops.
 			Code("DIAL_FAILED").
 			In("pool").
@@ -222,7 +280,18 @@ func (p *ConnPool) GetOrDial(ctx context.Context, remoteAddr string, dial func(c
 	}
 
 	// Put the new connection into the pool and immediately check it out.
-	return p.putAndGet(remoteAddr, conn)
+	wrapper, putErr := p.putAndGet(remoteAddr, conn)
+	if putErr != nil {
+		// Clean up dialMu entry if no connections exist for this address
+		p.mu.Lock()
+		connList := p.conns[remoteAddr]
+		if len(connList) == 0 {
+			p.dialMu.Delete(remoteAddr)
+		}
+		p.mu.Unlock()
+		return nil, putErr
+	}
+	return wrapper, nil
 }
 
 // putAndGet adds a newly-dialed connection to the pool and returns it
@@ -308,13 +377,21 @@ func (p *ConnPool) Put(conn net.Conn) error {
 	defer p.mu.Unlock()
 
 	if p.closed {
-		return conn.Close()
+		conn.Close()
+		return oops.
+			Code("POOL_CLOSED").
+			In("pool").
+			Errorf("pool is closed; connection not pooled")
 	}
 
 	connList := p.conns[remoteAddr]
 
 	if p.exceedsCapacity(connList) {
-		return conn.Close()
+		conn.Close()
+		return oops.
+			Code("POOL_FULL").
+			In("pool").
+			Errorf("pool at capacity; connection not pooled")
 	}
 
 	if p.isDuplicateConn(connList, conn) {
@@ -498,7 +575,7 @@ func (p *ConnPool) Drain(ctx context.Context) error {
 			return oops.
 				Code("DRAIN_TIMEOUT").
 				In("pool").
-				Wrapf(ctx.Err(), "drain: %d connections still in use", p.Stats()["in_use"])
+				Wrapf(ctx.Err(), "drain: %d connections still in use", stats["in_use"])
 		case <-ticker.C:
 			// Poll again.
 		}
@@ -560,7 +637,12 @@ func (p *ConnPool) Close() error {
 				remaining = append(remaining, pooledConn)
 			} else {
 				if err := pooledConn.conn.Close(); err != nil {
-					errs = append(errs, err)
+					wrappedErr := oops.
+						Code("CLOSE_FAILED").
+						In("pool").
+						With("address", addr).
+						Wrapf(err, "failed to close connection to %s", addr)
+					errs = append(errs, wrappedErr)
 				}
 			}
 		}
@@ -572,7 +654,14 @@ func (p *ConnPool) Close() error {
 		}
 	}
 
-	return errors.Join(errs...)
+	if len(errs) > 0 {
+		return oops.
+			Code("CLOSE_PARTIAL").
+			In("pool").
+			With("failed_count", len(errs)).
+			Wrapf(errors.Join(errs...), "failed to close %d connection(s)", len(errs))
+	}
+	return nil
 }
 
 // Stats returns pool statistics
@@ -674,38 +763,42 @@ func (p *ConnPool) shouldStopCleanup() bool {
 
 // performCleanupCycle executes a single cleanup cycle for all connections
 func (p *ConnPool) performCleanupCycle() {
-	p.mu.Lock()
-	defer p.mu.Unlock()
+	var toClose []*PooledConn
 
+	p.mu.Lock()
 	for addr, connList := range p.conns {
-		validConns := p.filterValidConnections(connList)
+		validConns, expired := p.filterValidConnections(connList)
+		toClose = append(toClose, expired...)
 		p.updateConnectionMap(addr, validConns)
+	}
+	p.mu.Unlock()
+
+	// Close expired connections outside the lock
+	for _, pc := range toClose {
+		pc.conn.Close()
 	}
 }
 
-// filterValidConnections separates valid connections from expired ones
-func (p *ConnPool) filterValidConnections(connList []*PooledConn) []*PooledConn {
+// filterValidConnections separates valid connections from expired ones.
+// Returns two slices: valid connections and expired connections to close.
+func (p *ConnPool) filterValidConnections(connList []*PooledConn) ([]*PooledConn, []*PooledConn) {
 	validConns := make([]*PooledConn, 0, len(connList))
+	expiredConns := make([]*PooledConn, 0)
 
 	for _, pooledConn := range connList {
 		if p.shouldKeepConnection(pooledConn) {
 			validConns = append(validConns, pooledConn)
 		} else {
-			p.closeExpiredConnection(pooledConn)
+			expiredConns = append(expiredConns, pooledConn)
 		}
 	}
 
-	return validConns
+	return validConns, expiredConns
 }
 
 // shouldKeepConnection determines if a connection should be retained
 func (p *ConnPool) shouldKeepConnection(pooledConn *PooledConn) bool {
 	return pooledConn.inUse || p.isValid(pooledConn)
-}
-
-// closeExpiredConnection properly closes an expired connection
-func (p *ConnPool) closeExpiredConnection(pooledConn *PooledConn) {
-	pooledConn.conn.Close()
 }
 
 // updateConnectionMap updates the pool map with valid connections.

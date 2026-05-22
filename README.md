@@ -20,9 +20,8 @@ import (
     "context"
     "net"
     "time"
-    "github.com/go-i2p/go-noise/pool"
-    "github.com/go-i2p/go-noise"
-    "github.com/go-i2p/go-noise/internal"
+    
+    "github.com/go-i2p/pool"
 )
 
 func main() {
@@ -31,23 +30,25 @@ func main() {
         MaxSize: 10,                // Max connections per address (0 = unlimited)
         MaxAge:  30 * time.Minute,  // Connection max lifetime
         MaxIdle: 5 * time.Minute,   // Max idle time before cleanup
-        ReadyCheck: func(c net.Conn) bool {
-            // Only pool connections with completed handshakes
-            if nc, ok := c.(*noise.NoiseConn); ok {
-                return nc.GetConnectionState() == internal.StateEstablished
-            }
-            return true
-        },
     })
     defer p.Close()
 
-    // Use with transport functions
-    noise.SetGlobalConnPool(p)
-
-    // Example config (replace with your actual configuration)
-    config := noise.NewConnConfig("XX", true)
-    conn, err := noise.DialNoiseWithPool("tcp", "127.0.0.1:8080", config)
+    // Use GetOrDial to atomically get or create a connection
+    conn, err := p.GetOrDial(context.Background(), "example.com:80", 
+        func(ctx context.Context) (net.Conn, error) {
+            return net.Dial("tcp", "example.com:80")
+        })
     if err != nil {
+        panic(err)
+    }
+    
+    // Connection automatically returned to pool when closed
+    defer conn.Close()
+    
+    // Use the connection...
+    conn.Write([]byte("GET / HTTP/1.0\r\n\r\n"))
+}
+```
         panic(err)
     }
     // Connection automatically returned to pool when closed
@@ -62,8 +63,8 @@ serializing dials per address to prevent duplicate NTCP2 sessions:
 
 ```go
 conn, err := p.GetOrDial(ctx, "10.0.0.1:15555", func(ctx context.Context) (net.Conn, error) {
-    // Dial and perform Noise handshake
-    return noise.DialNoise("tcp", "10.0.0.1:15555", config)
+    // Dial and perform any handshake/protocol negotiation
+    return net.DialTimeout("tcp", "10.0.0.1:15555", 5*time.Second)
 })
 if err != nil {
     return err
