@@ -81,16 +81,17 @@ type Pool interface {
 // ConnPool manages a pool of reusable connections for performance optimization.
 // It only uses interface types (net.Conn, net.Addr) for maximum compatibility.
 type ConnPool struct {
-	mu          sync.RWMutex
-	conns       map[string][]*PooledConn // keyed by remote address
-	maxSize     int
-	maxTotal    int
-	maxAge      time.Duration
-	maxIdle     time.Duration
-	healthCheck func(net.Conn) bool
-	readyCheck  func(net.Conn) bool
-	closed      bool
-	done        chan struct{}
+	mu           sync.RWMutex
+	conns        map[string][]*PooledConn // keyed by remote address
+	connRegistry map[net.Conn]string      // tracks which address each conn is pooled under (AUDIT H-2)
+	maxSize      int
+	maxTotal     int
+	maxAge       time.Duration
+	maxIdle      time.Duration
+	healthCheck  func(net.Conn) bool
+	readyCheck   func(net.Conn) bool
+	closed       bool
+	done         chan struct{}
 	// dialMu serializes GetOrDial per address to prevent TOCTOU races.
 	dialMu sync.Map // map[string]*sync.Mutex
 }
@@ -112,14 +113,15 @@ func NewConnPool(config *PoolConfig) *ConnPool {
 	}
 
 	pool := &ConnPool{
-		conns:       make(map[string][]*PooledConn),
-		maxSize:     config.MaxSize,
-		maxTotal:    config.MaxTotal,
-		maxAge:      config.MaxAge,
-		maxIdle:     config.MaxIdle,
-		healthCheck: config.HealthCheck,
-		readyCheck:  config.ReadyCheck,
-		done:        make(chan struct{}),
+		conns:        make(map[string][]*PooledConn),
+		connRegistry: make(map[net.Conn]string),
+		maxSize:      config.MaxSize,
+		maxTotal:     config.MaxTotal,
+		maxAge:       config.MaxAge,
+		maxIdle:      config.MaxIdle,
+		healthCheck:  config.HealthCheck,
+		readyCheck:   config.ReadyCheck,
+		done:         make(chan struct{}),
 	}
 
 	// Start cleanup goroutine
@@ -266,13 +268,10 @@ func (p *ConnPool) GetOrDial(ctx context.Context, remoteAddr string, dial func(c
 	addrMu.Unlock()
 
 	if err != nil {
-		// Clean up dialMu entry if no connections exist for this address
-		p.mu.Lock()
-		connList := p.conns[remoteAddr]
-		if len(connList) == 0 {
-			p.dialMu.Delete(remoteAddr)
-		}
-		p.mu.Unlock()
+		// Note: We intentionally do NOT delete dialMu[remoteAddr] here.
+		// Cleanup would introduce a race where goroutine G1 loads mutex M1,
+		// G2 deletes the entry, and G3 creates mutex M2 for the same address,
+		// breaking the serialization guarantee (AUDIT H-1).
 		return nil, oops.
 			Code("DIAL_FAILED").
 			In("pool").
@@ -282,13 +281,8 @@ func (p *ConnPool) GetOrDial(ctx context.Context, remoteAddr string, dial func(c
 	// Put the new connection into the pool and immediately check it out.
 	wrapper, putErr := p.putAndGet(remoteAddr, conn)
 	if putErr != nil {
-		// Clean up dialMu entry if no connections exist for this address
-		p.mu.Lock()
-		connList := p.conns[remoteAddr]
-		if len(connList) == 0 {
-			p.dialMu.Delete(remoteAddr)
-		}
-		p.mu.Unlock()
+		// Note: We intentionally do NOT delete dialMu[remoteAddr] here.
+		// See comment above in dial error path (AUDIT H-1).
 		return nil, putErr
 	}
 	return wrapper, nil
@@ -331,6 +325,7 @@ func (p *ConnPool) putAndGet(remoteAddr string, conn net.Conn) (net.Conn, error)
 	pc := newPooledConn(conn, remoteAddr)
 	pc.inUse = true
 	p.conns[remoteAddr] = append(connList, pc)
+	p.connRegistry[conn] = remoteAddr // Register connection address mapping (AUDIT H-2)
 
 	return &PoolConnWrapper{
 		Conn: conn,
@@ -399,6 +394,7 @@ func (p *ConnPool) Put(conn net.Conn) error {
 	}
 
 	p.conns[remoteAddr] = append(connList, newPooledConn(conn, remoteAddr))
+	p.connRegistry[conn] = remoteAddr // Register connection address mapping (AUDIT H-2)
 	return nil
 }
 
@@ -425,8 +421,14 @@ func (p *ConnPool) exceedsCapacity(connList []*PooledConn) bool {
 	return false
 }
 
-// isDuplicateConn checks whether the connection is already present in the pool.
+// isDuplicateConn checks whether the connection is already present in the pool
+// under any address (AUDIT H-2). Returns true if the connection is already pooled.
 func (p *ConnPool) isDuplicateConn(connList []*PooledConn, conn net.Conn) bool {
+	// First check the global registry for pooling under any address
+	if _, found := p.connRegistry[conn]; found {
+		return true
+	}
+	// Fallback to linear scan of the target connList (should be redundant)
 	for _, existing := range connList {
 		if existing.conn == conn {
 			return true
@@ -502,6 +504,7 @@ func (p *ConnPool) removeConnLocked(remoteAddr string, conn net.Conn) {
 		if pooledConn.conn == conn {
 			connList = append(connList[:i], connList[i+1:]...)
 			p.updateConnectionMap(remoteAddr, connList)
+			delete(p.connRegistry, conn) // Clean up registry (AUDIT H-2)
 			return
 		}
 	}
