@@ -218,7 +218,12 @@ func (p *ConnPool) Get(remoteAddr string) net.Conn {
 // getOrDialMu returns the per-address mutex for GetOrDial serialization.
 func (p *ConnPool) getOrDialMu(remoteAddr string) *sync.Mutex {
 	val, _ := p.dialMu.LoadOrStore(remoteAddr, &sync.Mutex{})
-	return val.(*sync.Mutex)
+	mu, ok := val.(*sync.Mutex)
+	if !ok {
+		// This should never happen in correct usage, but makes corruption explicit (AUDIT M-1)
+		panic("dialMu corrupted: expected *sync.Mutex")
+	}
+	return mu
 }
 
 // GetOrDial atomically retrieves an idle connection for remoteAddr or, if none
