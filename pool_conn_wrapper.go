@@ -19,6 +19,8 @@ type PoolConnWrapper struct {
 
 // Close returns the connection to the pool instead of closing it.
 // Returns an error on double-close or if the pool rejects the connection.
+// If Release fails (e.g., CONNECTION_NOT_FOUND), the underlying connection
+// is closed defensively to prevent resource leaks (AUDIT M-5).
 func (w *PoolConnWrapper) Close() error {
 	w.mu.Lock()
 	defer w.mu.Unlock()
@@ -30,7 +32,13 @@ func (w *PoolConnWrapper) Close() error {
 	}
 	log.WithFields(logger.Fields{"pkg": "pool", "func": "PoolConnWrapper.Close"}).Debug("Returning pooled connection")
 	w.closed = true
-	return w.pool.Release(w.addr, w.Conn)
+	err := w.pool.Release(w.addr, w.Conn)
+	if err != nil {
+		// Release failed - defensively close the underlying connection
+		// to prevent resource leaks
+		_ = w.Conn.Close()
+	}
+	return err
 }
 
 // Discard closes the underlying connection and permanently removes it

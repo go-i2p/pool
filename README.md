@@ -4,7 +4,7 @@ The `pool` package provides connection pooling for the go-noise library. It enab
 
 ## Features
 
-- **Interface-Only Design**: Uses `net.Conn`, `net.Addr`, and `net.Listener` interfaces exclusively
+- **Interface-Only Design**: Uses `net.Conn` and `net.Addr` interfaces exclusively
 - **Connection Lifecycle Management**: Connections expire based on age and idle time
 - **Thread-Safe Operations**: All methods safe for concurrent use
 - **TOCTOU-Safe Dialing**: `GetOrDial` serializes dials per address to prevent duplicate sessions

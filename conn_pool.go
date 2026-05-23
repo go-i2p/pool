@@ -17,6 +17,18 @@ import (
 // caller supplies a PoolConfig without MaxSize and without setting Unbounded.
 const DefaultMaxSize = 10
 
+// DefaultDrainPollInterval is the default polling interval for Drain when
+// waiting for in-use connections to be released (AUDIT L-4).
+const DefaultDrainPollInterval = 50 * time.Millisecond
+
+// MinCleanupInterval is the minimum interval between background cleanup runs
+// to prevent tight loops when MaxIdle/MaxAge are very small (AUDIT L-4).
+const MinCleanupInterval = time.Second
+
+// DefaultCleanupInterval is the default interval between background cleanup
+// runs when MaxIdle and MaxAge are not set or are large (AUDIT L-4).
+const DefaultCleanupInterval = time.Minute
+
 // PoolConfig configures a connection pool
 type PoolConfig struct {
 	// MaxSize is the maximum number of connections per remote address.
@@ -184,7 +196,24 @@ func (p *ConnPool) Get(remoteAddr string) net.Conn {
 
 	// Run health check outside the lock if we have a candidate
 	if candidate != nil {
-		if p.healthCheck != nil && !p.healthCheck(candidate.conn) {
+		// Wrap health check with panic recovery (AUDIT M-2)
+		healthy := true
+		if p.healthCheck != nil {
+			func() {
+				defer func() {
+					if r := recover(); r != nil {
+						log.WithFields(logger.Fields{
+							"pkg": "pool", "func": "ConnPool.Get",
+							"remote_addr": candidate.remoteAddr,
+						}).Errorf("HealthCheck panicked: %v", r)
+						healthy = false
+					}
+				}()
+				healthy = p.healthCheck(candidate.conn)
+			}()
+		}
+
+		if !healthy {
 			// Health check failed. Re-acquire lock, mark as not in-use, and remove.
 			if err := candidate.conn.Close(); err != nil {
 				log.WithFields(logger.Fields{
@@ -240,6 +269,13 @@ func (p *ConnPool) getOrDialMu(remoteAddr string) *sync.Mutex {
 // atomic step.
 //
 // If ctx is cancelled before dial completes, GetOrDial returns ctx.Err().
+//
+// ADDRESSING: This function pools connections under the user-provided remoteAddr
+// parameter, allowing logical addressing (e.g., "proxy:8080"). This differs
+// from Put(), which uses conn.RemoteAddr().String() for physical addressing.
+// The returned PoolConnWrapper's Close() method uses Release() with the correct
+// logical address, maintaining consistency. Users should not mix GetOrDial with
+// manual Put() calls on the same connection unless the addresses match exactly.
 func (p *ConnPool) GetOrDial(ctx context.Context, remoteAddr string, dial func(ctx context.Context) (net.Conn, error)) (net.Conn, error) {
 	// Fast path: try to get an existing connection.
 	if conn := p.Get(remoteAddr); conn != nil {
@@ -272,6 +308,14 @@ func (p *ConnPool) GetOrDial(ctx context.Context, remoteAddr string, dial func(c
 	// potentially-slow ReadyCheck callback.
 	addrMu.Unlock()
 
+	// Validate dial callback return values (AUDIT M-4)
+	if err == nil && conn == nil {
+		return nil, oops.
+			Code("INVALID_DIAL_RESULT").
+			In("pool").
+			Errorf("dial callback returned (nil, nil); must return either (conn, nil) or (nil, error)")
+	}
+
 	if err != nil {
 		// Note: We intentionally do NOT delete dialMu[remoteAddr] here.
 		// Cleanup would introduce a race where goroutine G1 loads mutex M1,
@@ -299,7 +343,24 @@ func (p *ConnPool) putAndGet(remoteAddr string, conn net.Conn) (net.Conn, error)
 	log.WithFields(logger.Fields{"pkg": "pool", "func": "ConnPool.putAndGet", "remote_addr": remoteAddr}).Debug("Adding and checking out connection")
 	conn = unwrapPoolConn(conn)
 
-	if p.readyCheck != nil && !p.readyCheck(conn) {
+	// Wrap ready check with panic recovery (AUDIT M-2)
+	ready := true
+	if p.readyCheck != nil {
+		func() {
+			defer func() {
+				if r := recover(); r != nil {
+					log.WithFields(logger.Fields{
+						"pkg": "pool", "func": "ConnPool.putAndGet",
+						"remote_addr": remoteAddr,
+					}).Errorf("ReadyCheck panicked: %v", r)
+					ready = false
+				}
+			}()
+			ready = p.readyCheck(conn)
+		}()
+	}
+
+	if !ready {
 		conn.Close()
 		return nil, oops.
 			Code("CONNECTION_NOT_READY").
@@ -346,6 +407,13 @@ func (p *ConnPool) putAndGet(remoteAddr string, conn net.Conn) (net.Conn, error)
 // called before pooling; the connection is rejected (closed) if the check
 // returns false. Without a ReadyCheck, it is the caller's responsibility
 // to ensure the connection is in a usable state.
+//
+// ADDRESSING: Put() uses conn.RemoteAddr().String() as the pool key, which
+// reflects the connection's physical address. This differs from GetOrDial(),
+// which pools under the user-provided logical address parameter. Mixing
+// GetOrDial with manual Put() on the same connection may cause the connection
+// to be pooled under different addresses if they don't match. Use the wrapper's
+// Close() method (which calls Release with the correct address) for consistency.
 func (p *ConnPool) Put(conn net.Conn) error {
 	if conn == nil {
 		log.WithFields(logger.Fields{"pkg": "pool", "func": "ConnPool.Put"}).Warn("Attempted to put nil connection in pool")
@@ -357,7 +425,23 @@ func (p *ConnPool) Put(conn net.Conn) error {
 
 	conn = unwrapPoolConn(conn)
 
-	if p.readyCheck != nil && !p.readyCheck(conn) {
+	// Wrap ready check with panic recovery (AUDIT M-2)
+	ready := true
+	if p.readyCheck != nil {
+		func() {
+			defer func() {
+				if r := recover(); r != nil {
+					log.WithFields(logger.Fields{
+						"pkg": "pool", "func": "ConnPool.Put",
+					}).Errorf("ReadyCheck panicked: %v", r)
+					ready = false
+				}
+			}()
+			ready = p.readyCheck(conn)
+		}()
+	}
+
+	if !ready {
 		return oops.
 			Code("CONNECTION_NOT_READY").
 			In("pool").
@@ -372,6 +456,14 @@ func (p *ConnPool) Put(conn net.Conn) error {
 			Errorf("connection has nil RemoteAddr")
 	}
 	remoteAddr := addr.String()
+
+	// Validate non-empty address (AUDIT L-2)
+	if remoteAddr == "" {
+		return oops.
+			Code("INVALID_CONNECTION").
+			In("pool").
+			Errorf("connection has empty RemoteAddr")
+	}
 
 	p.mu.Lock()
 	defer p.mu.Unlock()
@@ -460,6 +552,12 @@ func newPooledConn(conn net.Conn, remoteAddr string) *PooledConn {
 // subsequent call to wrapper.Close() returns an ALREADY_CLOSED error instead
 // of issuing a second release (preventing a double-release vulnerability).
 func (p *ConnPool) Release(remoteAddr string, conn net.Conn) error {
+	// Explicit nil check for better error messages (AUDIT L-1)
+	if conn == nil {
+		return oops.Code("INVALID_CONNECTION").In("pool").
+			Errorf("cannot release nil connection")
+	}
+
 	// Unwrap PoolConnWrapper for correct identity comparison.
 	// Mark the wrapper closed to prevent a subsequent Close() from
 	// issuing a second release.
@@ -523,6 +621,13 @@ func (p *ConnPool) removeConnLocked(remoteAddr string, conn net.Conn) {
 // to avoid resource leaks). Returns nil on success.
 func (p *ConnPool) Remove(remoteAddr string, conn net.Conn) error {
 	log.WithFields(logger.Fields{"pkg": "pool", "func": "ConnPool.Remove", "remote_addr": remoteAddr}).Debug("Removing connection from pool")
+
+	// Explicit nil check for better error messages (AUDIT L-1)
+	if conn == nil {
+		return oops.Code("INVALID_CONNECTION").In("pool").
+			Errorf("cannot remove nil connection")
+	}
+
 	if wrapper, ok := conn.(*PoolConnWrapper); ok {
 		conn = wrapper.Conn
 	}
@@ -568,8 +673,7 @@ func (p *ConnPool) Remove(remoteAddr string, conn net.Conn) error {
 // only waits for the current in-use count to reach zero. Callers
 // should stop accepting new work before calling Drain.
 func (p *ConnPool) Drain(ctx context.Context) error {
-	const pollInterval = 50 * time.Millisecond
-	ticker := time.NewTicker(pollInterval)
+	ticker := time.NewTicker(DefaultDrainPollInterval)
 	defer ticker.Stop()
 
 	for {
@@ -728,17 +832,15 @@ func (p *ConnPool) totalConnsLocked() int {
 // non-zero) so that expired connections are evicted promptly for short-lived
 // pool configurations rather than waiting the hardcoded 1-minute default.
 func (p *ConnPool) cleanupInterval() time.Duration {
-	const defaultInterval = time.Minute
-	const minInterval = time.Second
-	interval := defaultInterval
+	interval := DefaultCleanupInterval
 	if p.maxIdle > 0 && p.maxIdle/2 < interval {
 		interval = p.maxIdle / 2
 	}
 	if p.maxAge > 0 && p.maxAge/2 < interval {
 		interval = p.maxAge / 2
 	}
-	if interval < minInterval {
-		interval = minInterval
+	if interval < MinCleanupInterval {
+		interval = MinCleanupInterval
 	}
 	return interval
 }
