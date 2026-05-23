@@ -697,6 +697,16 @@ func (p *ConnPool) Drain(ctx context.Context) error {
 // Snapshot returns a point-in-time copy of all pooled connections' metadata.
 // Each returned PooledConn is a shallow copy — the underlying net.Conn is
 // shared with the pool, so callers must not Close or Write on it. Use
+// Snapshot returns a shallow copy of all pooled connections for diagnostics,
+// monitoring, or testing purposes.
+//
+// WARNING: The returned PooledConn structs share the underlying net.Conn
+// references with the active pool. DO NOT call Close(), Write(), or Read()
+// on conn.NetConn() as this will corrupt pool state and break concurrent
+// users. If you need to interact with connections, use Get()/GetOrDial()
+// instead. Use Snapshot() only for read-only inspection of metadata
+// (created, lastUsed, inUse, remoteAddr).
+//
 // Snapshot for diagnostics, monitoring, or testing where you need to inspect
 // pool state without modifying it.
 func (p *ConnPool) Snapshot() []*PooledConn {
