@@ -204,27 +204,8 @@ func (p *ConnPool) Get(remoteAddr string) net.Conn {
 		return nil
 	}
 
-	// Find an available and valid connection.
-	// Expired connections are collected for closing outside the lock.
-	for i := 0; i < len(connList); i++ {
-		pooledConn := connList[i]
-		if pooledConn.inUse {
-			continue
-		}
-		if !p.isValid(pooledConn) {
-			// Collect for closing outside the lock
-			toClose = append(toClose, pooledConn)
-			connList = append(connList[:i], connList[i+1:]...)
-			i--
-			p.updateConnectionMap(remoteAddr, connList)
-			continue
-		}
-		// Found a valid candidate. Mark as tentatively in-use and break.
-		candidate = pooledConn
-		candidate.inUse = true
-		candidate.lastUsed = time.Now()
-		break
-	}
+	// Find an available and valid connection (AUDIT L2 fix: uses shared helper).
+	candidate, toClose = p.findCandidate(remoteAddr, connList)
 	p.mu.Unlock()
 
 	// Close expired connections outside the lock
@@ -308,27 +289,8 @@ func (p *ConnPool) GetWithContext(ctx context.Context, remoteAddr string) net.Co
 		return nil
 	}
 
-	// Find an available and valid connection.
-	// Expired connections are collected for closing outside the lock.
-	for i := 0; i < len(connList); i++ {
-		pooledConn := connList[i]
-		if pooledConn.inUse {
-			continue
-		}
-		if !p.isValid(pooledConn) {
-			// Collect for closing outside the lock
-			toClose = append(toClose, pooledConn)
-			connList = append(connList[:i], connList[i+1:]...)
-			i--
-			p.updateConnectionMap(remoteAddr, connList)
-			continue
-		}
-		// Found a valid candidate. Mark as tentatively in-use and break.
-		candidate = pooledConn
-		candidate.inUse = true
-		candidate.lastUsed = time.Now()
-		break
-	}
+	// Find an available and valid connection (AUDIT L2 fix: uses shared helper).
+	candidate, toClose = p.findCandidate(remoteAddr, connList)
 	p.mu.Unlock()
 
 	// Close expired connections outside the lock
@@ -423,7 +385,11 @@ func (p *ConnPool) getOrDialMu(remoteAddr string) (*sync.Mutex, error) {
 	val, _ := p.dialMu.LoadOrStore(remoteAddr, &sync.Mutex{})
 	mu, ok := val.(*sync.Mutex)
 	if !ok {
-		// AUDIT H-2 fix: return error instead of panic to prevent process crash
+		// AUDIT L6: This branch is unreachable in practice. dialMu is unexported
+		// and all writes to it go through getOrDialMu itself via LoadOrStore, which
+		// always stores *sync.Mutex values. The guard is retained as a defensive
+		// invariant check; sync.Map is memory-safe and cannot corrupt stored types
+		// through concurrent access.
 		return nil, oops.
 			Code("INTERNAL_ERROR").
 			In("pool").
@@ -1049,6 +1015,32 @@ func (p *ConnPool) isValid(pooledConn *PooledConn) bool {
 	}
 
 	return true
+}
+
+// totalConnsLocked returns the total connection count. Must hold mu.
+// findCandidate selects the first idle, valid connection from connList and
+// returns it (marked inUse) along with any expired connections that should be
+// closed outside the lock. The caller must hold p.mu (AUDIT L2 fix: extracted
+// from the duplicate candidate-selection loops in Get and GetWithContext).
+func (p *ConnPool) findCandidate(remoteAddr string, connList []*PooledConn) (candidate *PooledConn, toClose []*PooledConn) {
+	for i := 0; i < len(connList); i++ {
+		pooledConn := connList[i]
+		if pooledConn.inUse {
+			continue
+		}
+		if !p.isValid(pooledConn) {
+			toClose = append(toClose, pooledConn)
+			connList = append(connList[:i], connList[i+1:]...)
+			i--
+			p.updateConnectionMap(remoteAddr, connList)
+			continue
+		}
+		candidate = pooledConn
+		candidate.inUse = true
+		candidate.lastUsed = time.Now()
+		break
+	}
+	return candidate, toClose
 }
 
 // totalConnsLocked returns the total connection count. Must hold mu.
