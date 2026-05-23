@@ -375,10 +375,12 @@ func TestPut_ReadyCheckWithWrappedConn(t *testing.T) {
 	}
 }
 
-// TestDialMuCleanup_PreventMemoryLeak validates AUDIT H-1 fix:
-// dialMu entries for addresses with no pooled connections should be removed
-// during cleanup to prevent unbounded memory growth in long-running processes.
-func TestDialMuCleanup_PreventMemoryLeak(t *testing.T) {
+// TestDialMu_PersistsAfterCleanup validates AUDIT H3 fix:
+// dialMu entries must NOT be removed during cleanup cycles — removing them
+// would invalidate the one-at-a-time serialization guarantee in GetOrDial
+// by creating a TOCTOU race between goroutines calling LoadOrStore.
+// The accepted tradeoff is O(unique-addresses-ever-dialed) memory.
+func TestDialMu_PersistsAfterCleanup(t *testing.T) {
 	pool := NewConnPool(&PoolConfig{
 		MaxSize: 5,
 		MaxAge:  50 * time.Millisecond,
@@ -399,7 +401,6 @@ func TestDialMuCleanup_PreventMemoryLeak(t *testing.T) {
 	// Dial 10 unique addresses successfully
 	addrs := make([]string, 10)
 	for i := 0; i < 10; i++ {
-		addrs[i] = newMockConn("").remoteAddr.String()
 		addrs[i] = fmt.Sprintf("10.0.%d.1:%d", i, 8000+i)
 		conn, err := pool.GetOrDial(context.Background(), addrs[i], func(ctx context.Context) (net.Conn, error) {
 			return newMockConn(addrs[i]), nil
@@ -418,7 +419,7 @@ func TestDialMuCleanup_PreventMemoryLeak(t *testing.T) {
 	// Wait for connections to expire
 	time.Sleep(100 * time.Millisecond)
 
-	// Run cleanup cycle
+	// Run cleanup cycle — connections expire but dialMu entries persist (H3 fix)
 	pool.performCleanupCycle()
 
 	// Verify connections are removed
@@ -427,9 +428,9 @@ func TestDialMuCleanup_PreventMemoryLeak(t *testing.T) {
 		t.Errorf("Expected 0 connections after cleanup, got %d", stats["total"])
 	}
 
-	// Verify dialMu entries are also cleaned up (AUDIT H-1 fix)
-	if count := countDialMu(); count != 0 {
-		t.Errorf("Expected 0 dialMu entries after cleanup, got %d (memory leak)", count)
+	// dialMu entries must persist after cleanup to prevent TOCTOU races (AUDIT H3 fix)
+	if count := countDialMu(); count != 10 {
+		t.Errorf("Expected 10 dialMu entries to persist after cleanup (AUDIT H3 fix), got %d", count)
 	}
 
 	// Verify pool still works after cleanup
@@ -445,15 +446,16 @@ func TestDialMuCleanup_PreventMemoryLeak(t *testing.T) {
 	}
 	conn.Close()
 
-	// Verify new dialMu entry was created
-	if count := countDialMu(); count != 1 {
-		t.Errorf("Expected 1 dialMu entry after new dial, got %d", count)
+	// 11 total: 10 old + 1 new
+	if count := countDialMu(); count != 11 {
+		t.Errorf("Expected 11 dialMu entries after new dial, got %d", count)
 	}
 }
 
-// TestDialMuCleanup_FailedDials validates that failed dials don't leave
-// orphaned dialMu entries indefinitely.
-func TestDialMuCleanup_FailedDials(t *testing.T) {
+// TestDialMu_PersistsAfterFailedDials validates that failed dials do not leave
+// orphaned dialMu entries that get cleaned up — they persist intentionally to
+// serialize future retry dials (AUDIT H3 fix).
+func TestDialMu_PersistsAfterFailedDials(t *testing.T) {
 	pool := NewConnPool(&PoolConfig{
 		MaxSize: 5,
 		MaxAge:  50 * time.Millisecond,
@@ -487,12 +489,12 @@ func TestDialMuCleanup_FailedDials(t *testing.T) {
 		t.Errorf("Expected 10 dialMu entries after failed dials, got %d", count)
 	}
 
-	// Run cleanup cycle
+	// Run cleanup cycle — dialMu entries persist intentionally (AUDIT H3 fix)
 	pool.performCleanupCycle()
 
-	// Since no connections were added, dialMu entries should be cleaned up
-	if count := countDialMu(); count != 0 {
-		t.Errorf("Expected 0 dialMu entries after cleanup of failed dials, got %d (memory leak)", count)
+	// dialMu entries must remain after cleanup to prevent future TOCTOU races
+	if count := countDialMu(); count != 10 {
+		t.Errorf("Expected 10 dialMu entries to persist after cleanup (AUDIT H3 fix), got %d", count)
 	}
 }
 
@@ -524,4 +526,3 @@ func TestGetOrDial_DialReturnsConnAndError(t *testing.T) {
 		t.Errorf("Expected 0 connections after invalid dial result, got %d", stats["total"])
 	}
 }
-

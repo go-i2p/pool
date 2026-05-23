@@ -663,16 +663,24 @@ func TestPut_UnwrapsPoolConnWrapper(t *testing.T) {
 		t.Fatal("Get returned nil")
 	}
 
-	// Put the wrapped connection back (should unwrap it)
+	// Attempting to Put() a connection that is already in the pool (even via
+	// a wrapper) must return CONNECTION_ALREADY_POOLED (AUDIT L7 fix). The
+	// correct way to return a checked-out connection is wrapped.Close().
 	err := pool.Put(wrapped)
-	if err != nil {
-		t.Fatalf("Put wrapped conn failed: %v", err)
+	if err == nil {
+		t.Fatal("Put of already-pooled connection should return error")
+	}
+	if !strings.Contains(err.Error(), "CONNECTION_ALREADY_POOLED") && !strings.Contains(err.Error(), "already pooled") {
+		t.Errorf("Expected CONNECTION_ALREADY_POOLED error, got: %v", err)
 	}
 
-	// Should be the same underlying connection, so duplicate check = 1
+	// Release properly via Close so pool cleanup works.
+	wrapped.Close()
+
+	// After proper release, pool should still have 1 connection.
 	stats := pool.Stats()
 	if stats["total"] != 1 {
-		t.Errorf("Expected 1 after put-back of wrapper, got total=%d", stats["total"])
+		t.Errorf("Expected 1 after proper release, got total=%d", stats["total"])
 	}
 }
 
@@ -973,9 +981,13 @@ func TestRemove_AddressNotInPool(t *testing.T) {
 	}
 }
 
-// TestDialMu_CleanedUpOnLastRemove verifies that per-address dial mutexes
-// are deleted from dialMu when the last connection for an address is removed.
-func TestDialMu_CleanedUpOnLastRemove(t *testing.T) {
+// TestDialMu_NotDeletedOnLastRemove verifies that per-address dial mutexes
+// are intentionally NOT deleted from dialMu when the last connection for an
+// address is removed (AUDIT H3 fix). Deleting the mutex entry on removal
+// creates a TOCTOU race in GetOrDial: a goroutine that already obtained the
+// old mutex via LoadOrStore could proceed to dial concurrently with another
+// goroutine that stores a fresh mutex, violating the one-at-a-time guarantee.
+func TestDialMu_NotDeletedOnLastRemove(t *testing.T) {
 	p := NewConnPool(&PoolConfig{
 		MaxSize: 5,
 		MaxAge:  time.Hour,
@@ -994,7 +1006,8 @@ func TestDialMu_CleanedUpOnLastRemove(t *testing.T) {
 		t.Fatal("dialMu entry should exist after getOrDialMu")
 	}
 
-	// Add and then remove a connection — should clean up dialMu.
+	// Add and then remove a connection — dialMu must remain to preserve
+	// the serialization invariant for any in-flight GetOrDial callers.
 	conn := newMockConn(addr)
 	if err := p.Put(conn); err != nil {
 		t.Fatalf("Put: %v", err)
@@ -1003,8 +1016,8 @@ func TestDialMu_CleanedUpOnLastRemove(t *testing.T) {
 		t.Fatalf("Remove: %v", err)
 	}
 
-	if _, ok := p.dialMu.Load(addr); ok {
-		t.Error("dialMu entry should be deleted after last connection is removed")
+	if _, ok := p.dialMu.Load(addr); !ok {
+		t.Error("dialMu entry should NOT be deleted after last connection is removed (AUDIT H3 fix)")
 	}
 }
 

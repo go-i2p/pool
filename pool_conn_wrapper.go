@@ -18,9 +18,12 @@ type PoolConnWrapper struct {
 }
 
 // Close returns the connection to the pool instead of closing it.
-// Returns an error on double-close or if the pool rejects the connection.
-// If Release fails (e.g., CONNECTION_NOT_FOUND), the underlying connection
-// is closed defensively to prevent resource leaks (AUDIT M-5).
+// Returns an error on double-close or if the underlying connection close fails.
+// If Release fails internally (e.g., CONNECTION_NOT_FOUND due to stale pool
+// state), the underlying connection is closed defensively, the Release error
+// is logged at WARN level, and nil is returned — because from the caller's
+// perspective the connection is gone (AUDIT L5 fix). A non-nil error is
+// returned only when the underlying w.Conn.Close() itself fails.
 func (w *PoolConnWrapper) Close() error {
 	w.mu.Lock()
 	defer w.mu.Unlock()
@@ -32,13 +35,16 @@ func (w *PoolConnWrapper) Close() error {
 	}
 	log.WithFields(logger.Fields{"pkg": "pool", "func": "PoolConnWrapper.Close"}).Debug("Returning pooled connection")
 	w.closed = true
-	err := w.pool.Release(w.addr, w.Conn)
-	if err != nil {
-		// Release failed - defensively close the underlying connection
-		// to prevent resource leaks
-		_ = w.Conn.Close()
+	if err := w.pool.Release(w.addr, w.Conn); err != nil {
+		// Release failed — defensively close the underlying connection to
+		// prevent resource leaks, log the pool-state anomaly, and return nil
+		// so callers using `defer conn.Close()` don't see spurious errors.
+		log.WithFields(logger.Fields{
+			"pkg": "pool", "func": "PoolConnWrapper.Close",
+		}).Warnf("Release failed (pool state anomaly): %v", err)
+		return w.Conn.Close()
 	}
-	return err
+	return nil
 }
 
 // Discard closes the underlying connection and permanently removes it
