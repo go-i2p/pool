@@ -18,15 +18,33 @@ import (
 const DefaultMaxSize = 10
 
 // DefaultDrainPollInterval is the default polling interval for Drain when
-// waiting for in-use connections to be released (AUDIT L-4).
+// waiting for in-use connections to be released.
+//
+// RATIONALE (AUDIT L-3): 50ms balances responsiveness (drain completes within
+// ~100ms of the last connection being released) against CPU overhead (20 checks
+// per second per waiting Drain call). Shorter intervals (e.g., 10ms) would
+// provide faster drain at the cost of 100 checks/second CPU load; longer
+// intervals (e.g., 100ms) would reduce overhead but delay drain completion.
 const DefaultDrainPollInterval = 50 * time.Millisecond
 
 // MinCleanupInterval is the minimum interval between background cleanup runs
-// to prevent tight loops when MaxIdle/MaxAge are very small (AUDIT L-4).
+// to prevent tight loops when MaxIdle/MaxAge are very small.
+//
+// RATIONALE (AUDIT L-3): 1 second prevents excessive cleanup overhead when
+// pool is configured with very short timeouts (e.g., MaxIdle=2s for testing).
+// Even with 2-second timeouts, checking every second ensures expired connections
+// are removed within 1 second of expiration, which is acceptable latency. Values
+// below 1s (e.g., 100ms) would cause unnecessary CPU churn for little benefit.
 const MinCleanupInterval = time.Second
 
 // DefaultCleanupInterval is the default interval between background cleanup
-// runs when MaxIdle and MaxAge are not set or are large (AUDIT L-4).
+// runs when MaxIdle and MaxAge are not set or are large.
+//
+// RATIONALE (AUDIT L-3): 1 minute provides a reasonable default for long-lived
+// pools where connections may be idle for hours. More frequent cleanup (e.g.,
+// every 10s) provides minimal benefit for typical pool lifetimes and increases
+// lock contention. Less frequent cleanup (e.g., 5 minutes) would delay removal
+// of expired connections too long for interactive workloads.
 const DefaultCleanupInterval = time.Minute
 
 // PoolConfig configures a connection pool
@@ -134,6 +152,12 @@ func NewConnPool(config *PoolConfig) *ConnPool {
 	// Apply the default per-address limit unless the caller explicitly
 	// opted in to unbounded growth (AUDIT L-1).
 	if config.MaxSize <= 0 && !config.Unbounded {
+		// AUDIT L-5: Warn on negative values (semantically invalid)
+		if config.MaxSize < 0 {
+			log.WithFields(logger.Fields{
+				"pkg": "pool", "func": "NewConnPool",
+			}).Warnf("Negative MaxSize (%d) is invalid; applying default %d", config.MaxSize, DefaultMaxSize)
+		}
 		config.MaxSize = DefaultMaxSize
 	}
 
@@ -574,12 +598,18 @@ func (p *ConnPool) putAndGet(remoteAddr string, conn net.Conn) (net.Conn, error)
 // returns false. Without a ReadyCheck, it is the caller's responsibility
 // to ensure the connection is in a usable state.
 //
-// ADDRESSING: Put() uses conn.RemoteAddr().String() as the pool key, which
-// reflects the connection's physical address. This differs from GetOrDial(),
-// which pools under the user-provided logical address parameter. Mixing
-// GetOrDial with manual Put() on the same connection may cause the connection
-// to be pooled under different addresses if they don't match. Use the wrapper's
-// Close() method (which calls Release with the correct address) for consistency.
+// ADDRESSING (AUDIT L-1): Put() uses conn.RemoteAddr().String() as the pool
+// key, which reflects the connection's physical address. This differs from
+// GetOrDial(), which pools under the user-provided logical address parameter.
+// WARNING: If you obtained the connection via GetOrDial with a logical address
+// (e.g., "proxy:8080"), DO NOT call Put() manually — use the wrapper's Close()
+// method instead, or the connection will be pooled under its physical address
+// (e.g., "10.0.0.1:8080") and Get("proxy:8080") will fail to find it.
+//
+// PERFORMANCE (AUDIT L-2): The RemoteAddr().String() method is called before
+// acquiring the pool lock. If your net.Addr implementation's String() method
+// is slow or blocking, this will delay connection pooling. Ensure RemoteAddr()
+// returns quickly and returns a non-empty string.
 func (p *ConnPool) Put(conn net.Conn) error {
 	if conn == nil {
 		log.WithFields(logger.Fields{"pkg": "pool", "func": "ConnPool.Put"}).Warn("Attempted to put nil connection in pool")
@@ -687,17 +717,10 @@ func (p *ConnPool) exceedsCapacity(connList []*PooledConn) bool {
 // isDuplicateConn checks whether the connection is already present in the pool
 // under any address (AUDIT H-2). Returns true if the connection is already pooled.
 func (p *ConnPool) isDuplicateConn(connList []*PooledConn, conn net.Conn) bool {
-	// First check the global registry for pooling under any address
-	if _, found := p.connRegistry[conn]; found {
-		return true
-	}
-	// Fallback to linear scan of the target connList (should be redundant)
-	for _, existing := range connList {
-		if existing.conn == conn {
-			return true
-		}
-	}
-	return false
+	// Check the global registry (AUDIT L-6: linear scan removed because
+	// connRegistry is kept in sync with connList in all Put/Remove operations)
+	_, found := p.connRegistry[conn]
+	return found
 }
 
 // newPooledConn creates a new PooledConn entry with current timestamps.
@@ -767,6 +790,8 @@ func (p *ConnPool) Release(remoteAddr string, conn net.Conn) error {
 func (p *ConnPool) removeConnLocked(remoteAddr string, conn net.Conn) {
 	connList, exists := p.conns[remoteAddr]
 	if !exists {
+		// AUDIT L-7: Defensive cleanup even if address not found
+		delete(p.connRegistry, conn)
 		return
 	}
 	for i, pooledConn := range connList {
@@ -777,6 +802,10 @@ func (p *ConnPool) removeConnLocked(remoteAddr string, conn net.Conn) {
 			return
 		}
 	}
+	// AUDIT L-7: Defensive cleanup even if connection not in list
+	// (should never happen if invariants are maintained, but defends
+	// against future bugs that break registry/connList sync)
+	delete(p.connRegistry, conn)
 }
 
 // Remove closes a connection and permanently removes it from the pool.
@@ -866,12 +895,13 @@ func (p *ConnPool) Drain(ctx context.Context) error {
 // Snapshot returns a shallow copy of all pooled connections for diagnostics,
 // monitoring, or testing purposes.
 //
-// WARNING: The returned PooledConn structs share the underlying net.Conn
-// references with the active pool. DO NOT call Close(), Write(), or Read()
-// on conn.NetConn() as this will corrupt pool state and break concurrent
-// users. If you need to interact with connections, use Get()/GetOrDial()
-// instead. Use Snapshot() only for read-only inspection of metadata
-// (created, lastUsed, inUse, remoteAddr).
+// WARNING (AUDIT L-4): The returned PooledConn structs share the underlying
+// net.Conn references with the active pool. DO NOT call Close(), Write(), or
+// Read() on conn.NetConn() — doing so will corrupt pool state, cause data
+// races (detectable with -race), and crash concurrent users. Treat returned
+// PooledConn entries as read-only metadata snapshots. If you need to interact
+// with connections, use Get()/GetOrDial() instead. Use Snapshot() only for
+// read-only inspection of metadata (created, lastUsed, inUse, remoteAddr).
 //
 // Snapshot for diagnostics, monitoring, or testing where you need to inspect
 // pool state without modifying it.
