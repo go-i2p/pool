@@ -106,6 +106,8 @@ type ConnPool struct {
 	done         chan struct{}
 	// dialMu serializes GetOrDial per address to prevent TOCTOU races.
 	dialMu sync.Map // map[string]*sync.Mutex
+	// cleanupWg tracks the cleanup goroutine for proper shutdown (AUDIT M-2 fix)
+	cleanupWg sync.WaitGroup
 }
 
 // NewConnPool creates a new connection pool with the given configuration
@@ -136,7 +138,8 @@ func NewConnPool(config *PoolConfig) *ConnPool {
 		done:         make(chan struct{}),
 	}
 
-	// Start cleanup goroutine
+	// Start cleanup goroutine (AUDIT M-2 fix: track with WaitGroup)
+	pool.cleanupWg.Add(1)
 	go pool.cleanup()
 
 	return pool
@@ -453,6 +456,14 @@ func (p *ConnPool) GetOrDial(ctx context.Context, remoteAddr string, dial func(c
 	addrMu.Unlock()
 
 	// Validate dial callback return values (AUDIT M-4)
+	if err != nil && conn != nil {
+		conn.Close()
+		return nil, oops.
+			Code("INVALID_DIAL_RESULT").
+			In("pool").
+			Errorf("dial callback returned both connection and error; must return either (conn, nil) or (nil, error)")
+	}
+
 	if err == nil && conn == nil {
 		return nil, oops.
 			Code("INVALID_DIAL_RESULT").
@@ -881,15 +892,22 @@ func (p *ConnPool) Snapshot() []*PooledConn {
 // and wait for them to be returned.
 func (p *ConnPool) Close() error {
 	p.mu.Lock()
-	defer p.mu.Unlock()
-
 	if p.closed {
+		p.mu.Unlock()
 		return nil
 	}
 
 	log.WithFields(logger.Fields{"pkg": "pool", "func": "ConnPool.Close"}).Debug("Closing connection pool")
 	p.closed = true
 	close(p.done)
+	p.mu.Unlock()
+
+	// Wait for cleanup goroutine to exit (AUDIT M-2 fix)
+	p.cleanupWg.Wait()
+
+	// Now close connections
+	p.mu.Lock()
+	defer p.mu.Unlock()
 
 	// Close only idle connections; in-use connections will be
 	// closed when returned via Release() or Discard().
@@ -1001,6 +1019,7 @@ func (p *ConnPool) cleanupInterval() time.Duration {
 
 // cleanup runs periodically to remove expired connections
 func (p *ConnPool) cleanup() {
+	defer p.cleanupWg.Done() // AUDIT M-2 fix: signal cleanup goroutine exit
 	ticker := time.NewTicker(p.cleanupInterval())
 	defer ticker.Stop()
 
