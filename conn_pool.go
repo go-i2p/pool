@@ -50,6 +50,12 @@ type PoolConfig struct {
 	Unbounded bool
 	// HealthCheck is an optional callback to probe connection liveness
 	// before returning it from Get(). Return true if healthy.
+	//
+	// PANIC RECOVERY (AUDIT M-3): If the callback panics, the panic is
+	// recovered and logged, and the connection is treated as unhealthy
+	// (removed from pool and closed). The panic does not propagate to
+	// the caller of Get(). Callers cannot distinguish between a panic
+	// and a legitimate "false" return value.
 	HealthCheck func(net.Conn) bool
 	// ReadyCheck is an optional callback invoked by Put() to verify that a
 	// connection is ready for reuse (e.g., that a Noise handshake has been
@@ -63,6 +69,11 @@ type PoolConfig struct {
 	//       }
 	//       return true
 	//   }
+	//
+	// PANIC RECOVERY (AUDIT M-3): If the callback panics, the panic is
+	// recovered and logged, and the connection is treated as not ready
+	// (rejected from pool and closed). The panic does not propagate to
+	// the caller of Put().
 	ReadyCheck func(net.Conn) bool
 }
 
@@ -948,7 +959,15 @@ func (p *ConnPool) Close() error {
 	return nil
 }
 
-// Stats returns pool statistics
+// Stats returns a snapshot of current pool statistics. The returned map is
+// a fresh allocation and can be safely modified by the caller without affecting
+// pool state (AUDIT M-6). Call Stats() again to get updated values.
+//
+// The returned map contains:
+//   - "total": total number of connections (in-use + available)
+//   - "in_use": connections currently checked out
+//   - "available": connections ready to be checked out
+//   - "addresses": number of unique remote addresses
 func (p *ConnPool) Stats() map[string]int {
 	p.mu.RLock()
 	defer p.mu.RUnlock()
@@ -1013,6 +1032,10 @@ func (p *ConnPool) cleanupInterval() time.Duration {
 	}
 	if interval < MinCleanupInterval {
 		interval = MinCleanupInterval
+	}
+	// AUDIT M-5 fix: defend against zero/negative intervals
+	if interval <= 0 {
+		interval = DefaultCleanupInterval
 	}
 	return interval
 }

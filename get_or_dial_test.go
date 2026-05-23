@@ -495,3 +495,33 @@ func TestDialMuCleanup_FailedDials(t *testing.T) {
 		t.Errorf("Expected 0 dialMu entries after cleanup of failed dials, got %d (memory leak)", count)
 	}
 }
+
+// TestGetOrDial_DialReturnsConnAndError validates AUDIT M-4 fix:
+// dial callback returning both connection and error is rejected.
+func TestGetOrDial_DialReturnsConnAndError(t *testing.T) {
+	pool := newTestPool(5)
+	defer pool.Close()
+
+	addr := "10.0.0.99:9999"
+	conn, err := pool.GetOrDial(context.Background(), addr, func(ctx context.Context) (net.Conn, error) {
+		// Invalid: return both connection and error
+		return newMockConn(addr), errors.New("some error")
+	})
+
+	if conn != nil {
+		t.Error("Expected nil connection when dial returns both conn and error")
+	}
+	if err == nil {
+		t.Fatal("Expected error, got nil")
+	}
+	if !strings.Contains(err.Error(), "both connection and error") {
+		t.Errorf("Expected error about returning both, got: %v", err)
+	}
+
+	// Verify no connection was added to pool
+	stats := pool.Stats()
+	if stats["total"] != 0 {
+		t.Errorf("Expected 0 connections after invalid dial result, got %d", stats["total"])
+	}
+}
+
