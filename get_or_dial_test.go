@@ -3,6 +3,7 @@ package pool
 import (
 	"context"
 	"errors"
+	"fmt"
 	"net"
 	"strings"
 	"sync"
@@ -371,5 +372,126 @@ func TestPut_ReadyCheckWithWrappedConn(t *testing.T) {
 	// ReadyCheck should receive the unwrapped connection
 	if checkedConn != inner {
 		t.Error("ReadyCheck should receive the unwrapped inner connection, not the wrapper")
+	}
+}
+
+// TestDialMuCleanup_PreventMemoryLeak validates AUDIT H-1 fix:
+// dialMu entries for addresses with no pooled connections should be removed
+// during cleanup to prevent unbounded memory growth in long-running processes.
+func TestDialMuCleanup_PreventMemoryLeak(t *testing.T) {
+	pool := NewConnPool(&PoolConfig{
+		MaxSize: 5,
+		MaxAge:  50 * time.Millisecond,
+		MaxIdle: 25 * time.Millisecond,
+	})
+	defer pool.Close()
+
+	// Helper to count dialMu entries
+	countDialMu := func() int {
+		count := 0
+		pool.dialMu.Range(func(key, value interface{}) bool {
+			count++
+			return true
+		})
+		return count
+	}
+
+	// Dial 10 unique addresses successfully
+	addrs := make([]string, 10)
+	for i := 0; i < 10; i++ {
+		addrs[i] = newMockConn("").remoteAddr.String()
+		addrs[i] = fmt.Sprintf("10.0.%d.1:%d", i, 8000+i)
+		conn, err := pool.GetOrDial(context.Background(), addrs[i], func(ctx context.Context) (net.Conn, error) {
+			return newMockConn(addrs[i]), nil
+		})
+		if err != nil {
+			t.Fatalf("GetOrDial %d: %v", i, err)
+		}
+		conn.Close() // return to pool
+	}
+
+	// Verify dialMu has 10 entries
+	if count := countDialMu(); count != 10 {
+		t.Errorf("Expected 10 dialMu entries, got %d", count)
+	}
+
+	// Wait for connections to expire
+	time.Sleep(100 * time.Millisecond)
+
+	// Run cleanup cycle
+	pool.performCleanupCycle()
+
+	// Verify connections are removed
+	stats := pool.Stats()
+	if stats["total"] != 0 {
+		t.Errorf("Expected 0 connections after cleanup, got %d", stats["total"])
+	}
+
+	// Verify dialMu entries are also cleaned up (AUDIT H-1 fix)
+	if count := countDialMu(); count != 0 {
+		t.Errorf("Expected 0 dialMu entries after cleanup, got %d (memory leak)", count)
+	}
+
+	// Verify pool still works after cleanup
+	addr := "10.0.99.1:9999"
+	conn, err := pool.GetOrDial(context.Background(), addr, func(ctx context.Context) (net.Conn, error) {
+		return newMockConn(addr), nil
+	})
+	if err != nil {
+		t.Fatalf("GetOrDial after cleanup: %v", err)
+	}
+	if conn == nil {
+		t.Fatal("Expected connection, got nil")
+	}
+	conn.Close()
+
+	// Verify new dialMu entry was created
+	if count := countDialMu(); count != 1 {
+		t.Errorf("Expected 1 dialMu entry after new dial, got %d", count)
+	}
+}
+
+// TestDialMuCleanup_FailedDials validates that failed dials don't leave
+// orphaned dialMu entries indefinitely.
+func TestDialMuCleanup_FailedDials(t *testing.T) {
+	pool := NewConnPool(&PoolConfig{
+		MaxSize: 5,
+		MaxAge:  50 * time.Millisecond,
+		MaxIdle: 25 * time.Millisecond,
+	})
+	defer pool.Close()
+
+	// Helper to count dialMu entries
+	countDialMu := func() int {
+		count := 0
+		pool.dialMu.Range(func(key, value interface{}) bool {
+			count++
+			return true
+		})
+		return count
+	}
+
+	// Attempt to dial 10 unique addresses that all fail
+	for i := 0; i < 10; i++ {
+		addr := fmt.Sprintf("10.0.%d.1:%d", i, 7000+i)
+		_, err := pool.GetOrDial(context.Background(), addr, func(ctx context.Context) (net.Conn, error) {
+			return nil, errors.New("dial failed")
+		})
+		if err == nil {
+			t.Fatalf("Expected dial error for address %d", i)
+		}
+	}
+
+	// Failed dials create dialMu entries (to serialize retries)
+	if count := countDialMu(); count != 10 {
+		t.Errorf("Expected 10 dialMu entries after failed dials, got %d", count)
+	}
+
+	// Run cleanup cycle
+	pool.performCleanupCycle()
+
+	// Since no connections were added, dialMu entries should be cleaned up
+	if count := countDialMu(); count != 0 {
+		t.Errorf("Expected 0 dialMu entries after cleanup of failed dials, got %d (memory leak)", count)
 	}
 }

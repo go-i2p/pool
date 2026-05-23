@@ -1,6 +1,7 @@
 package pool
 
 import (
+	"context"
 	"io"
 	"net"
 	"strings"
@@ -985,7 +986,10 @@ func TestDialMu_CleanedUpOnLastRemove(t *testing.T) {
 	addr := "10.0.0.13:9000"
 
 	// Force creation of a dialMu entry via getOrDialMu.
-	_ = p.getOrDialMu(addr)
+	_, err := p.getOrDialMu(addr)
+	if err != nil {
+		t.Fatalf("getOrDialMu: %v", err)
+	}
 	if _, ok := p.dialMu.Load(addr); !ok {
 		t.Fatal("dialMu entry should exist after getOrDialMu")
 	}
@@ -1133,4 +1137,160 @@ func TestCleanup_TickerFiresThenClosed(t *testing.T) {
 	time.Sleep(100 * time.Millisecond)
 
 	// No data race or panic means the test passed
+}
+
+// TestGetWithContext_CancellationDuringHealthCheck validates AUDIT M-1 fix:
+// GetWithContext respects context cancellation during health check execution.
+func TestGetWithContext_CancellationDuringHealthCheck(t *testing.T) {
+	// Create a channel to block the health check
+	healthCheckBlocked := make(chan struct{})
+	healthCheckStarted := make(chan struct{})
+
+	pool := NewConnPool(&PoolConfig{
+		MaxSize: 5,
+		MaxAge:  time.Hour,
+		MaxIdle: time.Hour,
+		HealthCheck: func(c net.Conn) bool {
+			close(healthCheckStarted)
+			<-healthCheckBlocked // Block until test signals
+			return true
+		},
+	})
+	defer pool.Close()
+
+	// Put a connection in the pool
+	conn := newMockConn("10.0.0.1:8080")
+	if err := pool.Put(conn); err != nil {
+		t.Fatalf("Put: %v", err)
+	}
+
+	// Create a context with timeout
+	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancel()
+
+	// Try to get connection with context (will block on health check)
+	done := make(chan net.Conn, 1)
+	go func() {
+		done <- pool.GetWithContext(ctx, "10.0.0.1:8080")
+	}()
+
+	// Wait for health check to start
+	<-healthCheckStarted
+
+	// Wait for context to timeout
+	<-ctx.Done()
+
+	// Unblock health check
+	close(healthCheckBlocked)
+
+	// GetWithContext should return nil due to context cancellation
+	result := <-done
+	if result != nil {
+		t.Error("Expected nil due to context cancellation, got connection")
+	}
+
+	// Verify connection is back in pool and usable
+	stats := pool.Stats()
+	if stats["available"] != 1 {
+		t.Errorf("Expected 1 available connection, got %d", stats["available"])
+	}
+}
+
+// TestGetWithContext_HealthCheckPasses validates that GetWithContext works
+// normally when context is not cancelled.
+func TestGetWithContext_HealthCheckPasses(t *testing.T) {
+	pool := NewConnPool(&PoolConfig{
+		MaxSize: 5,
+		MaxAge:  time.Hour,
+		MaxIdle: time.Hour,
+		HealthCheck: func(c net.Conn) bool {
+			return true
+		},
+	})
+	defer pool.Close()
+
+	// Put a connection in the pool
+	conn := newMockConn("10.0.0.2:8080")
+	if err := pool.Put(conn); err != nil {
+		t.Fatalf("Put: %v", err)
+	}
+
+	// Get with context
+	ctx := context.Background()
+	result := pool.GetWithContext(ctx, "10.0.0.2:8080")
+	if result == nil {
+		t.Fatal("Expected connection, got nil")
+	}
+
+	// Verify connection is in use
+	stats := pool.Stats()
+	if stats["in_use"] != 1 {
+		t.Errorf("Expected 1 in_use connection, got %d", stats["in_use"])
+	}
+}
+
+// TestGetWithContext_ContextAlreadyCancelled validates that GetWithContext
+// returns nil immediately if context is already cancelled.
+func TestGetWithContext_ContextAlreadyCancelled(t *testing.T) {
+	pool := NewConnPool(&PoolConfig{
+		MaxSize: 5,
+		MaxAge:  time.Hour,
+		MaxIdle: time.Hour,
+	})
+	defer pool.Close()
+
+	// Put a connection in the pool
+	conn := newMockConn("10.0.0.3:8080")
+	if err := pool.Put(conn); err != nil {
+		t.Fatalf("Put: %v", err)
+	}
+
+	// Create cancelled context
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	// Get with cancelled context
+	result := pool.GetWithContext(ctx, "10.0.0.3:8080")
+	if result != nil {
+		t.Error("Expected nil due to cancelled context, got connection")
+	}
+
+	// Verify connection is still available
+	stats := pool.Stats()
+	if stats["available"] != 1 {
+		t.Errorf("Expected 1 available connection, got %d", stats["available"])
+	}
+}
+
+// TestGetWithContext_HealthCheckPanics validates that panic recovery works
+// in GetWithContext.
+func TestGetWithContext_HealthCheckPanics(t *testing.T) {
+	pool := NewConnPool(&PoolConfig{
+		MaxSize: 5,
+		MaxAge:  time.Hour,
+		MaxIdle: time.Hour,
+		HealthCheck: func(c net.Conn) bool {
+			panic("health check panic")
+		},
+	})
+	defer pool.Close()
+
+	// Put a connection in the pool
+	conn := newMockConn("10.0.0.4:8080")
+	if err := pool.Put(conn); err != nil {
+		t.Fatalf("Put: %v", err)
+	}
+
+	// Get with context (should handle panic)
+	ctx := context.Background()
+	result := pool.GetWithContext(ctx, "10.0.0.4:8080")
+	if result != nil {
+		t.Error("Expected nil due to panic in health check, got connection")
+	}
+
+	// Verify connection is removed from pool
+	stats := pool.Stats()
+	if stats["total"] != 0 {
+		t.Errorf("Expected 0 connections after panic, got %d", stats["total"])
+	}
 }

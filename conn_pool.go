@@ -244,15 +244,156 @@ func (p *ConnPool) Get(remoteAddr string) net.Conn {
 	return nil
 }
 
+// GetWithContext retrieves a connection from the pool for the given remote address,
+// respecting context cancellation during health check execution. Returns nil if no
+// suitable connection is available or if the context is cancelled.
+//
+// This method is recommended over Get() for applications with request deadlines or
+// timeout requirements, as it prevents indefinite blocking if the health check
+// callback performs blocking I/O (AUDIT M-1 fix).
+//
+// If ctx is cancelled before the health check completes, the candidate connection
+// is returned to the pool and nil is returned.
+func (p *ConnPool) GetWithContext(ctx context.Context, remoteAddr string) net.Conn {
+	var candidate *PooledConn
+	var toClose []*PooledConn
+
+	p.mu.Lock()
+	if p.closed {
+		p.mu.Unlock()
+		log.WithFields(logger.Fields{"pkg": "pool", "func": "ConnPool.GetWithContext"}).Debug("GetWithContext called on closed pool")
+		return nil
+	}
+
+	connList, exists := p.conns[remoteAddr]
+	if !exists || len(connList) == 0 {
+		p.mu.Unlock()
+		return nil
+	}
+
+	// Find an available and valid connection.
+	// Expired connections are collected for closing outside the lock.
+	for i := 0; i < len(connList); i++ {
+		pooledConn := connList[i]
+		if pooledConn.inUse {
+			continue
+		}
+		if !p.isValid(pooledConn) {
+			// Collect for closing outside the lock
+			toClose = append(toClose, pooledConn)
+			connList = append(connList[:i], connList[i+1:]...)
+			i--
+			p.updateConnectionMap(remoteAddr, connList)
+			continue
+		}
+		// Found a valid candidate. Mark as tentatively in-use and break.
+		candidate = pooledConn
+		candidate.inUse = true
+		candidate.lastUsed = time.Now()
+		break
+	}
+	p.mu.Unlock()
+
+	// Close expired connections outside the lock
+	for _, pc := range toClose {
+		if err := pc.conn.Close(); err != nil {
+			log.WithFields(logger.Fields{
+				"pkg": "pool", "func": "ConnPool.GetWithContext",
+				"remote_addr": pc.remoteAddr,
+			}).Warnf("failed to close expired connection: %v", err)
+		}
+	}
+
+	// Run health check outside the lock if we have a candidate
+	if candidate != nil {
+		// Check context before running health check
+		if err := ctx.Err(); err != nil {
+			// Context already cancelled, return connection to pool
+			p.mu.Lock()
+			candidate.inUse = false
+			p.mu.Unlock()
+			return nil
+		}
+
+		// Wrap health check with panic recovery and context cancellation (AUDIT M-1 fix)
+		healthy := true
+		if p.healthCheck != nil {
+			// Run health check in a goroutine with context cancellation
+			healthResult := make(chan bool, 1)
+			go func() {
+				defer func() {
+					if r := recover(); r != nil {
+						log.WithFields(logger.Fields{
+							"pkg": "pool", "func": "ConnPool.GetWithContext",
+							"remote_addr": candidate.remoteAddr,
+						}).Errorf("HealthCheck panicked: %v", r)
+						healthResult <- false
+					}
+				}()
+				healthResult <- p.healthCheck(candidate.conn)
+			}()
+
+			select {
+			case healthy = <-healthResult:
+				// Health check completed
+			case <-ctx.Done():
+				// Context cancelled during health check
+				log.WithFields(logger.Fields{
+					"pkg": "pool", "func": "ConnPool.GetWithContext",
+					"remote_addr": candidate.remoteAddr,
+				}).Debug("Context cancelled during health check")
+				// Return connection to pool
+				p.mu.Lock()
+				candidate.inUse = false
+				p.mu.Unlock()
+				return nil
+			}
+		}
+
+		if !healthy {
+			// Health check failed. Re-acquire lock, mark as not in-use, and remove.
+			if err := candidate.conn.Close(); err != nil {
+				log.WithFields(logger.Fields{
+					"pkg": "pool", "func": "ConnPool.GetWithContext",
+					"remote_addr": candidate.remoteAddr,
+				}).Warnf("failed to close unhealthy connection: %v", err)
+			}
+			p.mu.Lock()
+			connList := p.conns[remoteAddr]
+			for i, pc := range connList {
+				if pc == candidate {
+					connList = append(connList[:i], connList[i+1:]...)
+					p.updateConnectionMap(remoteAddr, connList)
+					break
+				}
+			}
+			p.mu.Unlock()
+			return nil
+		}
+		// Health check passed (or no health check configured)
+		return &PoolConnWrapper{
+			Conn: candidate.conn,
+			pool: p,
+			addr: remoteAddr,
+		}
+	}
+
+	return nil
+}
+
 // getOrDialMu returns the per-address mutex for GetOrDial serialization.
-func (p *ConnPool) getOrDialMu(remoteAddr string) *sync.Mutex {
+// Returns an error if the dialMu map has been corrupted (contains non-mutex values).
+func (p *ConnPool) getOrDialMu(remoteAddr string) (*sync.Mutex, error) {
 	val, _ := p.dialMu.LoadOrStore(remoteAddr, &sync.Mutex{})
 	mu, ok := val.(*sync.Mutex)
 	if !ok {
-		// This should never happen in correct usage, but makes corruption explicit (AUDIT M-1)
-		panic("dialMu corrupted: expected *sync.Mutex")
+		// AUDIT H-2 fix: return error instead of panic to prevent process crash
+		return nil, oops.
+			Code("INTERNAL_ERROR").
+			In("pool").
+			Errorf("dialMu corrupted for address %s: expected *sync.Mutex, got %T", remoteAddr, val)
 	}
-	return mu
+	return mu, nil
 }
 
 // GetOrDial atomically retrieves an idle connection for remoteAddr or, if none
@@ -283,7 +424,10 @@ func (p *ConnPool) GetOrDial(ctx context.Context, remoteAddr string, dial func(c
 	}
 
 	// Serialize dialing per address to prevent duplicate sessions.
-	addrMu := p.getOrDialMu(remoteAddr)
+	addrMu, err := p.getOrDialMu(remoteAddr)
+	if err != nil {
+		return nil, err
+	}
 	addrMu.Lock()
 
 	// Re-check after acquiring the per-address lock — another goroutine
@@ -891,6 +1035,21 @@ func (p *ConnPool) performCleanupCycle() {
 		toClose = append(toClose, expired...)
 		p.updateConnectionMap(addr, validConns)
 	}
+
+	// Clean up orphaned dialMu entries (AUDIT H-1 fix).
+	// If an address has no pooled connections, its dial mutex can be removed.
+	// This prevents unbounded memory growth in long-running processes that
+	// dial many transient addresses (e.g., failed dials, expired connections).
+	p.dialMu.Range(func(key, value interface{}) bool {
+		addr, ok := key.(string)
+		if !ok {
+			return true // skip malformed key
+		}
+		if _, exists := p.conns[addr]; !exists {
+			p.dialMu.Delete(addr)
+		}
+		return true
+	})
 	p.mu.Unlock()
 
 	// Close expired connections outside the lock
