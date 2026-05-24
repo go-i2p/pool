@@ -33,7 +33,6 @@ func (w *PoolConnWrapper) Close() error {
 		return oops.Code("ALREADY_CLOSED").In("pool").
 			Errorf("connection wrapper already closed")
 	}
-	log.WithFields(logger.Fields{"pkg": "pool", "func": "PoolConnWrapper.Close"}).Debug("Returning pooled connection")
 	w.closed = true
 	if err := w.pool.Release(w.addr, w.Conn); err != nil {
 		// Release failed — defensively close the underlying connection to
@@ -44,6 +43,7 @@ func (w *PoolConnWrapper) Close() error {
 		}).Warnf("Release failed (pool state anomaly): %v", err)
 		return w.Conn.Close()
 	}
+	log.WithFields(logger.Fields{"pkg": "pool", "func": "PoolConnWrapper.Close"}).Debug("Returned pooled connection to pool")
 	return nil
 }
 

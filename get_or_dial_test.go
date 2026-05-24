@@ -149,6 +149,14 @@ func TestGetOrDial_SerializesDialsPerAddress(t *testing.T) {
 	if maxConc > 1 {
 		t.Errorf("expected max 1 concurrent dial for same address, got %d", maxConc)
 	}
+
+	// AUDIT L-5: verify total dial count equals 1 — the serialization guarantee
+	// means only the first goroutine should dial; all subsequent goroutines must
+	// find the pooled connection and reuse it without dialing.
+	totalDials := atomic.LoadInt32(&dialCount)
+	if totalDials != 1 {
+		t.Errorf("expected exactly 1 total dial for same address, got %d (TOCTOU race may have occurred)", totalDials)
+	}
 }
 
 func TestGetOrDial_DifferentAddressesDialConcurrently(t *testing.T) {

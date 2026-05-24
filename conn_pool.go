@@ -124,8 +124,22 @@ type Pool interface {
 	Close() error
 }
 
+// Compile-time assertion: *ConnPool must satisfy the Pool interface (AUDIT L-1).
+// If a future change breaks this contract, the build fails immediately here.
+var _ Pool = (*ConnPool)(nil)
+
 // ConnPool manages a pool of reusable connections for performance optimization.
 // It only uses interface types (net.Conn, net.Addr) for maximum compatibility.
+//
+// Memory growth note: dialMu retains one *sync.Mutex per unique remote address
+// ever passed to GetOrDial. These entries are never deleted because deletion
+// would reintroduce the TOCTOU race that dialMu is designed to prevent. For a
+// long-running I2P router that contacts many unique peers, expect roughly
+// 24–48 bytes of retained heap per unique address dialed over the pool's
+// lifetime. At 10,000 unique peers this is approximately 240–480 KB; at
+// 100,000 peers it is approximately 2.4–4.8 MB. If per-address mutex retention
+// is unacceptable for your workload, create a new ConnPool periodically and
+// migrate callers to the new instance (AUDIT M-4).
 type ConnPool struct {
 	mu           sync.RWMutex
 	conns        map[string][]*PooledConn // keyed by remote address
@@ -384,6 +398,17 @@ func (p *ConnPool) GetWithContext(ctx context.Context, remoteAddr string) net.Co
 // getOrDialMu returns the per-address mutex for GetOrDial serialization.
 // Returns an error if the dialMu map has been corrupted (contains non-mutex values).
 func (p *ConnPool) getOrDialMu(remoteAddr string) (*sync.Mutex, error) {
+	// Fast path: avoid allocating a new mutex on cache hits (AUDIT L-4).
+	if v, ok := p.dialMu.Load(remoteAddr); ok {
+		mu, ok := v.(*sync.Mutex)
+		if !ok {
+			return nil, oops.
+				Code("INTERNAL_ERROR").
+				In("pool").
+				Errorf("dialMu corrupted for address %s: expected *sync.Mutex, got %T", remoteAddr, v)
+		}
+		return mu, nil
+	}
 	val, _ := p.dialMu.LoadOrStore(remoteAddr, &sync.Mutex{})
 	mu, ok := val.(*sync.Mutex)
 	if !ok {
@@ -459,18 +484,30 @@ func (p *ConnPool) GetOrDial(ctx context.Context, remoteAddr string, dial func(c
 		return nil, err
 	}
 
+	// Check that the pool has not been closed since we acquired addrMu.
+	// Without this guard, a concurrent Close() could allow a full dial
+	// (including Noise handshake) to complete only to be discarded
+	// inside putAndGet — wasting resources on both ends (AUDIT M-2).
+	p.mu.RLock()
+	closed := p.closed
+	p.mu.RUnlock()
+	if closed {
+		addrMu.Unlock()
+		unlocked = true
+		return nil, oops.
+			Code("POOL_CLOSED").
+			In("pool").
+			Errorf("GetOrDial: pool is closed")
+	}
+
 	// Dial outside the pool lock.
 	log.WithFields(logger.Fields{"pkg": "pool", "func": "ConnPool.dialNew", "remote_addr": remoteAddr}).Debug("Dialing new connection for pool")
 	conn, err := dial(ctx)
 
-	// Release addrMu immediately after dial completes, before ReadyCheck.
-	// This allows other goroutines to proceed without waiting for our
-	// potentially-slow ReadyCheck callback.
-	addrMu.Unlock()
-	unlocked = true
-
 	// Validate dial callback return values (AUDIT M-4)
 	if err != nil && conn != nil {
+		addrMu.Unlock()
+		unlocked = true
 		conn.Close()
 		return nil, oops.
 			Code("INVALID_DIAL_RESULT").
@@ -479,6 +516,8 @@ func (p *ConnPool) GetOrDial(ctx context.Context, remoteAddr string, dial func(c
 	}
 
 	if err == nil && conn == nil {
+		addrMu.Unlock()
+		unlocked = true
 		return nil, oops.
 			Code("INVALID_DIAL_RESULT").
 			In("pool").
@@ -490,6 +529,8 @@ func (p *ConnPool) GetOrDial(ctx context.Context, remoteAddr string, dial func(c
 		// Cleanup would introduce a race where goroutine G1 loads mutex M1,
 		// G2 deletes the entry, and G3 creates mutex M2 for the same address,
 		// breaking the serialization guarantee (AUDIT H-1).
+		addrMu.Unlock()
+		unlocked = true
 		return nil, oops.
 			Code("DIAL_FAILED").
 			In("pool").
@@ -497,7 +538,13 @@ func (p *ConnPool) GetOrDial(ctx context.Context, remoteAddr string, dial func(c
 	}
 
 	// Put the new connection into the pool and immediately check it out.
+	// addrMu is held until putAndGet completes so that waiting goroutines
+	// cannot observe an empty pool and dial a duplicate connection. This
+	// closes the TOCTOU window documented in AUDIT H-1: the per-address
+	// lock now covers the entire dial-and-insert operation atomically.
 	wrapper, putErr := p.putAndGet(remoteAddr, conn)
+	addrMu.Unlock()
+	unlocked = true
 	if putErr != nil {
 		// Note: We intentionally do NOT delete dialMu[remoteAddr] here.
 		// See comment above in dial error path (AUDIT H-1).
@@ -810,6 +857,11 @@ func (p *ConnPool) Remove(remoteAddr string, conn net.Conn) error {
 	}
 
 	if wrapper, ok := conn.(*PoolConnWrapper); ok {
+		// Mark the wrapper closed to prevent a subsequent Close() from
+		// issuing a second Remove/Release call (AUDIT L-2).
+		wrapper.mu.Lock()
+		wrapper.closed = true
+		wrapper.mu.Unlock()
 		conn = wrapper.Conn
 	}
 
@@ -1034,6 +1086,7 @@ func (p *ConnPool) findCandidate(remoteAddr string, connList []*PooledConn) (can
 			toClose = append(toClose, pooledConn)
 			connList = append(connList[:i], connList[i+1:]...)
 			i--
+			delete(p.connRegistry, pooledConn.conn) // keep registry in sync (AUDIT M-1)
 			p.updateConnectionMap(remoteAddr, connList)
 			continue
 		}

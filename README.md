@@ -27,7 +27,7 @@ import (
 func main() {
     // Create a connection pool
     p := pool.NewConnPool(&pool.PoolConfig{
-        MaxSize: 10,                // Max connections per address (0 = unlimited)
+        MaxSize: 10,                // Max connections per address (0 = default 10; use Unbounded:true for no limit)
         MaxAge:  30 * time.Minute,  // Connection max lifetime
         MaxIdle: 5 * time.Minute,   // Max idle time before cleanup
     })
@@ -89,12 +89,26 @@ p.Close()
 
 ## Configuration
 
-- `MaxSize`: Maximum connections per remote address (default: 10, 0 = unlimited)
+- `MaxSize`: Maximum connections per remote address (default: 10). A zero or negative value applies the default limit (10). To disable the per-address limit entirely, set `Unbounded: true`.
 - `MaxTotal`: Maximum total connections across all addresses (0 = unlimited)
 - `MaxAge`: Maximum connection lifetime (default: 30 minutes)
 - `MaxIdle`: Maximum idle time before cleanup (default: 5 minutes)
 - `HealthCheck`: Optional liveness probe called by `Get()` before returning a connection
 - `ReadyCheck`: Optional check called by `Put()` to verify handshake completion
+
+## Memory Growth Characteristics
+
+The pool retains one `*sync.Mutex` per unique remote address ever passed to `GetOrDial`. These entries are **never evicted** — deleting them would reintroduce the TOCTOU race that serialized dialing is designed to prevent.
+
+For a long-running I2P router expect approximately 24–48 bytes of retained heap per unique peer address dialed over the pool's lifetime:
+
+| Unique peers contacted | Approximate retained memory |
+|---|---|
+| 1,000 | ~24–48 KB |
+| 10,000 | ~240–480 KB |
+| 100,000 | ~2.4–4.8 MB |
+
+If this growth is unacceptable, create a fresh `ConnPool` periodically and migrate callers to the new instance.
 
 ## Thread Safety
 

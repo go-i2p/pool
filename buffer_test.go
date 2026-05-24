@@ -2,6 +2,7 @@ package pool
 
 import (
 	"context"
+	"fmt"
 	"io"
 	"net"
 	"strings"
@@ -1309,5 +1310,31 @@ func TestGetWithContext_HealthCheckPanics(t *testing.T) {
 	stats := pool.Stats()
 	if stats["total"] != 0 {
 		t.Errorf("Expected 0 connections after panic, got %d", stats["total"])
+	}
+}
+
+// TestCleanup_ConcurrentClose exercises the path where Close() races with
+// performCleanupCycle. The race detector must not report a data race.
+// This covers AUDIT L-6: the cleanup goroutine ticker-fires path is run
+// concurrently with Close() to confirm proper synchronisation (AUDIT L-6).
+func TestCleanup_ConcurrentClose(t *testing.T) {
+	const iterations = 20
+	for i := 0; i < iterations; i++ {
+		p := NewConnPool(&PoolConfig{
+			MaxSize: 5,
+			MaxAge:  50 * time.Millisecond,
+			MaxIdle: 50 * time.Millisecond,
+		})
+
+		// Add several connections so cleanup has real work to do.
+		for j := 0; j < 3; j++ {
+			addr := fmt.Sprintf("10.0.%d.%d:1234", i, j)
+			_ = p.Put(newMockConn(addr))
+		}
+
+		// Let the connections expire, then Close concurrently with the
+		// next cleanup tick.
+		time.Sleep(60 * time.Millisecond)
+		p.Close()
 	}
 }
