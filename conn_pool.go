@@ -158,7 +158,9 @@ type ConnPool struct {
 	cleanupWg sync.WaitGroup
 }
 
-// NewConnPool creates a new connection pool with the given configuration
+// NewConnPool creates a new connection pool with the given configuration.
+// The caller's *PoolConfig is read but never modified; effective defaults are
+// derived into local variables only (M-1).
 func NewConnPool(config *PoolConfig) *ConnPool {
 	log.WithFields(logger.Fields{"pkg": "pool", "func": "NewConnPool"}).Debug("Creating new connection pool")
 	if config == nil {
@@ -168,22 +170,24 @@ func NewConnPool(config *PoolConfig) *ConnPool {
 			MaxIdle: 5 * time.Minute,
 		}
 	}
-	// Apply the default per-address limit unless the caller explicitly
-	// opted in to unbounded growth (AUDIT L-1).
-	if config.MaxSize <= 0 && !config.Unbounded {
-		// AUDIT L-5: Warn on negative values (semantically invalid)
-		if config.MaxSize < 0 {
+	// Derive effective MaxSize without mutating the caller's struct (M-1).
+	// Per the Go standard library convention (http.Server, tls.Config), config
+	// structs are read but never modified by the function that consumes them.
+	effectiveMaxSize := config.MaxSize
+	if effectiveMaxSize <= 0 && !config.Unbounded {
+		// Warn on negative values (semantically invalid)
+		if effectiveMaxSize < 0 {
 			log.WithFields(logger.Fields{
 				"pkg": "pool", "func": "NewConnPool",
-			}).Warnf("Negative MaxSize (%d) is invalid; applying default %d", config.MaxSize, DefaultMaxSize)
+			}).Warnf("Negative MaxSize (%d) is invalid; applying default %d", effectiveMaxSize, DefaultMaxSize)
 		}
-		config.MaxSize = DefaultMaxSize
+		effectiveMaxSize = DefaultMaxSize
 	}
 
 	pool := &ConnPool{
 		conns:        make(map[string][]*PooledConn),
 		connRegistry: make(map[net.Conn]string),
-		maxSize:      config.MaxSize,
+		maxSize:      effectiveMaxSize,
 		maxTotal:     config.MaxTotal,
 		maxAge:       config.MaxAge,
 		maxIdle:      config.MaxIdle,
@@ -439,6 +443,16 @@ func (p *ConnPool) getOrDialMu(remoteAddr string) (*sync.Mutex, error) {
 // atomic step.
 //
 // If ctx is cancelled before dial completes, GetOrDial returns ctx.Err().
+//
+// LOCKING AND HEALTH CHECK: When the per-address dial lock (addrMu) is held
+// and a re-check of the pool finds an existing connection, HealthCheck is
+// executed while addrMu is still held. The lock is released immediately after
+// Get() returns, so the HealthCheck itself runs within the lock window.
+// Callers providing a HealthCheck that performs blocking I/O (e.g., a Noise
+// ping round-trip) should be aware that concurrent GetOrDial calls for the
+// same address will be serialised for the duration of each health check.
+// For workloads with many concurrent callers per address and a slow
+// HealthCheck, prefer GetWithContext() with a timeout to bound latency.
 //
 // ADDRESSING: This function pools connections under the user-provided remoteAddr
 // parameter, allowing logical addressing (e.g., "proxy:8080"). This differs
