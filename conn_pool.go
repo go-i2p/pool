@@ -815,13 +815,12 @@ func (p *ConnPool) Release(remoteAddr string, conn net.Conn) error {
 
 	if p.closed {
 		// Remove the in-use entry from the map so Stats()/Drain() no
-		// longer see it, then close the underlying connection.
+		// longer see it, then close the underlying connection best-effort.
+		// POOL_CLOSED is always returned so callers (e.g. PoolConnWrapper)
+		// can distinguish "pool closed, conn already closed" from other
+		// failures and avoid calling Close() a second time (L-4, L-6).
 		p.removeConnLocked(remoteAddr, conn)
-		closeErr := conn.Close()
-		if closeErr != nil {
-			return oops.Code("POOL_CLOSED").In("pool").
-				Wrapf(closeErr, "pool closed; connection closed during release for %s", remoteAddr)
-		}
+		conn.Close() //nolint:errcheck // best-effort; POOL_CLOSED is the primary signal
 		return oops.Code("POOL_CLOSED").In("pool").
 			Errorf("pool closed; connection closed during release for %s", remoteAddr)
 	}
@@ -1188,6 +1187,16 @@ func (p *ConnPool) shouldStopCleanup() bool {
 	return p.closed
 }
 
+// closeExpiredConn closes a single expired pooled connection, logging any error.
+func closeExpiredConn(pc *PooledConn) {
+	if err := pc.conn.Close(); err != nil {
+		log.WithFields(logger.Fields{
+			"pkg": "pool", "func": "performCleanupCycle",
+			"remote_addr": pc.remoteAddr,
+		}).Warnf("failed to close expired connection: %v", err)
+	}
+}
+
 // performCleanupCycle executes a single cleanup cycle for all connections
 func (p *ConnPool) performCleanupCycle() {
 	var toClose []*PooledConn
@@ -1206,12 +1215,7 @@ func (p *ConnPool) performCleanupCycle() {
 
 	// Close expired connections outside the lock
 	for _, pc := range toClose {
-		if err := pc.conn.Close(); err != nil {
-			log.WithFields(logger.Fields{
-				"pkg": "pool", "func": "performCleanupCycle",
-				"remote_addr": pc.remoteAddr,
-			}).Warnf("failed to close expired connection: %v", err)
-		}
+		closeExpiredConn(pc)
 	}
 }
 
