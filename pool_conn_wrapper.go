@@ -9,6 +9,18 @@ import (
 	"github.com/samber/oops"
 )
 
+// PooledConnection is a net.Conn that exposes Discard() for permanently
+// removing a broken connection from the pool. All connections returned by
+// Get, GetWithContext, and GetOrDial satisfy this interface, so callers who
+// program against the Pool interface can call Discard() without a type
+// assertion to *PoolConnWrapper.
+type PooledConnection interface {
+	net.Conn
+	// Discard closes the connection and permanently removes it from the pool.
+	// Use this when the connection is known to be broken.
+	Discard() error
+}
+
 // PoolConnWrapper wraps a pooled connection to handle automatic release
 type PoolConnWrapper struct {
 	net.Conn

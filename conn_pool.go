@@ -100,24 +100,26 @@ type PoolConfig struct {
 // metrics-instrumented pool can depend on Pool instead of *ConnPool.
 type Pool interface {
 	// Get retrieves an idle connection for remoteAddr, or nil if none is available.
-	Get(remoteAddr string) net.Conn
+	Get(remoteAddr string) PooledConnection
 	// GetWithContext retrieves an idle connection for remoteAddr, respecting
 	// context cancellation during health check execution. This method is
 	// recommended over Get() for applications with request deadlines or
 	// timeout requirements (AUDIT L1 fix).
-	GetWithContext(ctx context.Context, remoteAddr string) net.Conn
+	GetWithContext(ctx context.Context, remoteAddr string) PooledConnection
 	// Put returns a connection to the pool for reuse.
 	Put(conn net.Conn) error
 	// GetOrDial retrieves an idle connection for remoteAddr or dials a new one.
-	GetOrDial(ctx context.Context, remoteAddr string, dial func(context.Context) (net.Conn, error)) (net.Conn, error)
+	GetOrDial(ctx context.Context, remoteAddr string, dial func(context.Context) (net.Conn, error)) (PooledConnection, error)
 	// Release marks a connection as available for reuse without closing it.
 	Release(addr string, conn net.Conn) error
 	// Remove removes a connection from the pool and closes it.
 	Remove(addr string, conn net.Conn) error
 	// Drain waits for all in-use connections to be returned, up to the context deadline.
 	Drain(ctx context.Context) error
-	// Snapshot returns a shallow copy of the current pool state for inspection.
-	Snapshot() []*PooledConn
+	// Snapshot returns a read-only metadata snapshot of the current pool state.
+	// The returned ConnSnapshot values carry no live net.Conn handles and are
+	// safe to store and inspect without risk of corrupting pool state.
+	Snapshot() []ConnSnapshot
 	// Stats returns pool statistics (total connections, in-use count, etc.).
 	Stats() map[string]int
 	// Close closes the pool and all connections it holds.
@@ -205,79 +207,12 @@ func NewConnPool(config *PoolConfig) *ConnPool {
 
 // Get retrieves a connection from the pool for the given remote address.
 // Returns nil if no suitable connection is available.
-func (p *ConnPool) Get(remoteAddr string) net.Conn {
-	var candidate *PooledConn
-	var toClose []*PooledConn
-
-	p.mu.Lock()
-	if p.closed {
-		p.mu.Unlock()
-		log.WithFields(logger.Fields{"pkg": "pool", "func": "ConnPool.Get"}).Debug("Get called on closed pool")
-		return nil
-	}
-
-	connList, exists := p.conns[remoteAddr]
-	if !exists || len(connList) == 0 {
-		p.mu.Unlock()
-		return nil
-	}
-
-	// Find an available and valid connection (AUDIT L2 fix: uses shared helper).
-	candidate, toClose = p.findCandidate(remoteAddr, connList)
-	p.mu.Unlock()
-
-	// Close expired connections outside the lock
-	for _, pc := range toClose {
-		if err := pc.conn.Close(); err != nil {
-			log.WithFields(logger.Fields{
-				"pkg": "pool", "func": "ConnPool.Get",
-				"remote_addr": pc.remoteAddr,
-			}).Warnf("failed to close expired connection: %v", err)
-		}
-	}
-
-	// Run health check outside the lock if we have a candidate
-	if candidate != nil {
-		// Wrap health check with panic recovery (AUDIT M-2)
-		healthy := true
-		if p.healthCheck != nil {
-			func() {
-				defer func() {
-					if r := recover(); r != nil {
-						log.WithFields(logger.Fields{
-							"pkg": "pool", "func": "ConnPool.Get",
-							"remote_addr": candidate.remoteAddr,
-						}).Errorf("HealthCheck panicked: %v", r)
-						healthy = false
-					}
-				}()
-				healthy = p.healthCheck(candidate.conn)
-			}()
-		}
-
-		if !healthy {
-			// Health check failed. Close the connection and remove from pool.
-			// Use removeConnLocked to keep connRegistry in sync (AUDIT M1 fix).
-			if err := candidate.conn.Close(); err != nil {
-				log.WithFields(logger.Fields{
-					"pkg": "pool", "func": "ConnPool.Get",
-					"remote_addr": candidate.remoteAddr,
-				}).Warnf("failed to close unhealthy connection: %v", err)
-			}
-			p.mu.Lock()
-			p.removeConnLocked(remoteAddr, candidate.conn)
-			p.mu.Unlock()
-			return nil
-		}
-		// Health check passed (or no health check configured)
-		return &PoolConnWrapper{
-			Conn: candidate.conn,
-			pool: p,
-			addr: remoteAddr,
-		}
-	}
-
-	return nil
+//
+// Get delegates to GetWithContext with a background context. Use
+// GetWithContext directly if the caller has a deadline or cancellation
+// requirement, so that a blocking HealthCheck can be interrupted.
+func (p *ConnPool) Get(remoteAddr string) PooledConnection {
+	return p.GetWithContext(context.Background(), remoteAddr)
 }
 
 // GetWithContext retrieves a connection from the pool for the given remote address,
@@ -290,7 +225,7 @@ func (p *ConnPool) Get(remoteAddr string) net.Conn {
 //
 // If ctx is cancelled before the health check completes, the candidate connection
 // is returned to the pool and nil is returned.
-func (p *ConnPool) GetWithContext(ctx context.Context, remoteAddr string) net.Conn {
+func (p *ConnPool) GetWithContext(ctx context.Context, remoteAddr string) PooledConnection {
 	var candidate *PooledConn
 	var toClose []*PooledConn
 
@@ -460,7 +395,7 @@ func (p *ConnPool) getOrDialMu(remoteAddr string) (*sync.Mutex, error) {
 // The returned PoolConnWrapper's Close() method uses Release() with the correct
 // logical address, maintaining consistency. Users should not mix GetOrDial with
 // manual Put() calls on the same connection unless the addresses match exactly.
-func (p *ConnPool) GetOrDial(ctx context.Context, remoteAddr string, dial func(ctx context.Context) (net.Conn, error)) (net.Conn, error) {
+func (p *ConnPool) GetOrDial(ctx context.Context, remoteAddr string, dial func(ctx context.Context) (net.Conn, error)) (PooledConnection, error) {
 	// Fast path: try to get an existing connection.
 	if conn := p.Get(remoteAddr); conn != nil {
 		return conn, nil
@@ -569,7 +504,7 @@ func (p *ConnPool) GetOrDial(ctx context.Context, remoteAddr string, dial func(c
 
 // putAndGet adds a newly-dialed connection to the pool and returns it
 // as a checked-out PoolConnWrapper in a single atomic step.
-func (p *ConnPool) putAndGet(remoteAddr string, conn net.Conn) (net.Conn, error) {
+func (p *ConnPool) putAndGet(remoteAddr string, conn net.Conn) (PooledConnection, error) {
 	log.WithFields(logger.Fields{"pkg": "pool", "func": "ConnPool.putAndGet", "remote_addr": remoteAddr}).Debug("Adding and checking out connection")
 	conn = unwrapPoolConn(conn)
 
@@ -952,28 +887,25 @@ func (p *ConnPool) Drain(ctx context.Context) error {
 	}
 }
 
-// Snapshot returns a shallow copy of all pooled connections' metadata for
-// diagnostics, monitoring, or testing purposes (AUDIT L4 fix).
+// Snapshot returns a read-only metadata snapshot of all pooled connections
+// for diagnostics, monitoring, or testing purposes.
 //
-// WARNING: The returned PooledConn structs share the underlying net.Conn
-// references with the active pool. DO NOT call Close(), Write(), or Read()
-// on conn.NetConn() — doing so will corrupt pool state, cause data races
-// (detectable with -race), and crash concurrent users. Treat returned
-// PooledConn entries as read-only metadata snapshots. If you need to interact
-// with connections, use Get()/GetOrDial() instead.
-func (p *ConnPool) Snapshot() []*PooledConn {
+// Each returned ConnSnapshot is a value copy containing only metadata fields
+// (Address, CreatedAt, LastUsedAt, IsInUse). No live net.Conn handle is
+// reachable from the snapshot, so callers cannot accidentally corrupt pool
+// state or trigger data races by interacting with the underlying connections.
+func (p *ConnPool) Snapshot() []ConnSnapshot {
 	p.mu.RLock()
 	defer p.mu.RUnlock()
 
-	var result []*PooledConn
+	var result []ConnSnapshot
 	for _, connList := range p.conns {
 		for _, pc := range connList {
-			result = append(result, &PooledConn{
-				conn:       pc.conn,
-				created:    pc.created,
-				lastUsed:   pc.lastUsed,
-				inUse:      pc.inUse,
-				remoteAddr: pc.remoteAddr,
+			result = append(result, ConnSnapshot{
+				Address:    pc.remoteAddr,
+				CreatedAt:  pc.created,
+				LastUsedAt: pc.lastUsed,
+				IsInUse:    pc.inUse,
 			})
 		}
 	}

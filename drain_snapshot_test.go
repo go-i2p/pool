@@ -188,7 +188,7 @@ func TestSnapshot_ReturnsAllConnections(t *testing.T) {
 	// Verify all addresses are present.
 	found := make(map[string]bool)
 	for _, pc := range snap {
-		found[pc.Address()] = true
+		found[pc.Address] = true
 	}
 	for _, addr := range addrs {
 		if !found[addr] {
@@ -205,61 +205,47 @@ func TestSnapshot_IncludesInUseConnections(t *testing.T) {
 	if len(snap) != 1 {
 		t.Fatalf("expected 1 connection in snapshot, got %d", len(snap))
 	}
-	if !snap[0].IsInUse() {
+	if !snap[0].IsInUse {
 		t.Error("snapshot should show connection as in-use")
 	}
 }
 
-func TestSnapshot_IsShallowCopy(t *testing.T) {
+func TestSnapshot_IsValueCopy(t *testing.T) {
 	f := setupPoolWithConn(t, "10.0.0.1:80")
 
 	snap1 := f.pool.Snapshot()
 	snap2 := f.pool.Snapshot()
 
-	// Two snapshots should return separate PooledConn structs.
-	if snap1[0] == snap2[0] {
-		t.Error("snapshots should return distinct PooledConn pointers")
+	// Two snapshots should return equal metadata values for the same connection.
+	if snap1[0].Address != snap2[0].Address {
+		t.Error("snapshots should agree on Address")
 	}
-
-	// But they should reference the same underlying net.Conn.
-	if snap1[0].NetConn() != snap2[0].NetConn() {
-		t.Error("snapshots should reference the same underlying net.Conn")
+	if snap1[0].IsInUse != snap2[0].IsInUse {
+		t.Error("snapshots should agree on IsInUse")
 	}
 }
 
-// --- PooledConn accessor tests ---
+// --- ConnSnapshot field tests ---
 
-func TestPooledConn_NetConn(t *testing.T) {
-	f := setupPoolWithConn(t, "10.0.0.1:80")
-
-	snap := f.pool.Snapshot()
-	if len(snap) != 1 {
-		t.Fatalf("expected 1 entry, got %d", len(snap))
-	}
-	if snap[0].NetConn() != f.conn {
-		t.Error("NetConn() should return the original connection")
-	}
-}
-
-func TestPooledConn_CreatedAt(t *testing.T) {
+func TestConnSnapshot_CreatedAt(t *testing.T) {
 	before := time.Now()
 	f := setupPoolWithConn(t, "10.0.0.1:80")
 	after := time.Now()
 
 	snap := f.pool.Snapshot()
-	created := snap[0].CreatedAt()
+	created := snap[0].CreatedAt
 	if created.Before(before) || created.After(after) {
-		t.Errorf("CreatedAt() %v should be between %v and %v", created, before, after)
+		t.Errorf("CreatedAt %v should be between %v and %v", created, before, after)
 	}
 }
 
-func TestPooledConn_LastUsedAt(t *testing.T) {
+func TestConnSnapshot_LastUsedAt(t *testing.T) {
 	f := setupPoolWithConn(t, "10.0.0.1:80")
 
 	snap := f.pool.Snapshot()
-	lastUsed := snap[0].LastUsedAt()
+	lastUsed := snap[0].LastUsedAt
 	if lastUsed.IsZero() {
-		t.Error("LastUsedAt() should not be zero")
+		t.Error("LastUsedAt should not be zero")
 	}
 
 	// Check out and release — lastUsed should advance.
@@ -268,40 +254,40 @@ func TestPooledConn_LastUsedAt(t *testing.T) {
 	_ = got
 
 	snap2 := f.pool.Snapshot()
-	if !snap2[0].LastUsedAt().After(lastUsed) {
-		t.Error("LastUsedAt() should advance after Get()")
+	if !snap2[0].LastUsedAt.After(lastUsed) {
+		t.Error("LastUsedAt should advance after Get()")
 	}
 }
 
-func TestPooledConn_IsInUse(t *testing.T) {
+func TestConnSnapshot_IsInUse(t *testing.T) {
 	f := setupPoolWithConn(t, "10.0.0.1:80")
 
 	snap := f.pool.Snapshot()
-	if snap[0].IsInUse() {
+	if snap[0].IsInUse {
 		t.Error("connection should not be in use after Put")
 	}
 
 	f.checkout(t)
 
 	snap = f.pool.Snapshot()
-	if !snap[0].IsInUse() {
+	if !snap[0].IsInUse {
 		t.Error("connection should be in use after Get")
 	}
 
 	f.pool.Release(f.addr, f.conn)
 
 	snap = f.pool.Snapshot()
-	if snap[0].IsInUse() {
+	if snap[0].IsInUse {
 		t.Error("connection should not be in use after Release")
 	}
 }
 
-func TestPooledConn_Address(t *testing.T) {
+func TestConnSnapshot_Address(t *testing.T) {
 	f := setupPoolWithConn(t, "10.0.0.1:80")
 
 	snap := f.pool.Snapshot()
-	if snap[0].Address() != f.addr {
-		t.Errorf("Address() = %q, want %q", snap[0].Address(), f.addr)
+	if snap[0].Address != f.addr {
+		t.Errorf("Address = %q, want %q", snap[0].Address, f.addr)
 	}
 }
 
@@ -325,7 +311,7 @@ func TestDrain_ThenSnapshot_AllIdle(t *testing.T) {
 
 	snap := f.pool.Snapshot()
 	for _, pc := range snap {
-		if pc.IsInUse() {
+		if pc.IsInUse {
 			t.Error("after Drain, no connection should be in use")
 		}
 	}
