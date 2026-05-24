@@ -784,6 +784,12 @@ func newPooledConn(conn net.Conn, remoteAddr string) *PooledConn {
 // Release marks a connection as no longer in use, making it available for reuse.
 // Returns an error if the pool is closed or the connection is not found.
 //
+// When the pool is closed, Release closes the connection and returns a
+// POOL_CLOSED-coded error regardless of whether the close succeeded or failed.
+// This lets callers (e.g., PoolConnWrapper.Close) distinguish "pool was closed,
+// connection already closed inside Release" from other release failures that
+// require the caller to close the connection themselves (L-4, L-6).
+//
 // If conn is a *PoolConnWrapper, the wrapper is marked closed so that a
 // subsequent call to wrapper.Close() returns an ALREADY_CLOSED error instead
 // of issuing a second release (preventing a double-release vulnerability).
@@ -811,7 +817,13 @@ func (p *ConnPool) Release(remoteAddr string, conn net.Conn) error {
 		// Remove the in-use entry from the map so Stats()/Drain() no
 		// longer see it, then close the underlying connection.
 		p.removeConnLocked(remoteAddr, conn)
-		return conn.Close()
+		closeErr := conn.Close()
+		if closeErr != nil {
+			return oops.Code("POOL_CLOSED").In("pool").
+				Wrapf(closeErr, "pool closed; connection closed during release for %s", remoteAddr)
+		}
+		return oops.Code("POOL_CLOSED").In("pool").
+			Errorf("pool closed; connection closed during release for %s", remoteAddr)
 	}
 
 	connList, exists := p.conns[remoteAddr]
@@ -1086,10 +1098,17 @@ func (p *ConnPool) isValid(pooledConn *PooledConn) bool {
 }
 
 // totalConnsLocked returns the total connection count. Must hold mu.
+func (p *ConnPool) totalConnsLocked() int {
+	total := 0
+	for _, list := range p.conns {
+		total += len(list)
+	}
+	return total
+}
+
 // findCandidate selects the first idle, valid connection from connList and
 // returns it (marked inUse) along with any expired connections that should be
-// closed outside the lock. The caller must hold p.mu (AUDIT L2 fix: extracted
-// from the duplicate candidate-selection loops in Get and GetWithContext).
+// closed outside the lock. The caller must hold p.mu.
 func (p *ConnPool) findCandidate(remoteAddr string, connList []*PooledConn) (candidate *PooledConn, toClose []*PooledConn) {
 	for i := 0; i < len(connList); i++ {
 		pooledConn := connList[i]
@@ -1110,15 +1129,6 @@ func (p *ConnPool) findCandidate(remoteAddr string, connList []*PooledConn) (can
 		break
 	}
 	return candidate, toClose
-}
-
-// totalConnsLocked returns the total connection count. Must hold mu.
-func (p *ConnPool) totalConnsLocked() int {
-	total := 0
-	for _, list := range p.conns {
-		total += len(list)
-	}
-	return total
 }
 
 // cleanupInterval returns the ticker period for the cleanup goroutine.
@@ -1196,7 +1206,12 @@ func (p *ConnPool) performCleanupCycle() {
 
 	// Close expired connections outside the lock
 	for _, pc := range toClose {
-		pc.conn.Close()
+		if err := pc.conn.Close(); err != nil {
+			log.WithFields(logger.Fields{
+				"pkg": "pool", "func": "performCleanupCycle",
+				"remote_addr": pc.remoteAddr,
+			}).Warnf("failed to close expired connection: %v", err)
+		}
 	}
 }
 
@@ -1204,7 +1219,7 @@ func (p *ConnPool) performCleanupCycle() {
 // Returns two slices: valid connections and expired connections to close.
 func (p *ConnPool) filterValidConnections(connList []*PooledConn) ([]*PooledConn, []*PooledConn) {
 	validConns := make([]*PooledConn, 0, len(connList))
-	expiredConns := make([]*PooledConn, 0)
+	expiredConns := make([]*PooledConn, 0, len(connList))
 
 	for _, pooledConn := range connList {
 		if p.shouldKeepConnection(pooledConn) {

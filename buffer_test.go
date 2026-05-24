@@ -548,8 +548,9 @@ func TestRelease_ClosedPool_ClosesConnection(t *testing.T) {
 
 	conn2 := newMockConn("127.0.0.1:8080")
 	err := pool.Release("127.0.0.1:8080", conn2)
-	if err != nil {
-		t.Errorf("Release on closed pool should not error: %v", err)
+	// Release on a closed pool closes the connection and returns POOL_CLOSED (L-6).
+	if err == nil {
+		t.Error("Release on closed pool should return POOL_CLOSED error")
 	}
 	if !conn2.IsClosed() {
 		t.Error("Connection should be closed when released to a closed pool")
@@ -621,10 +622,12 @@ func TestClose_SkipsInUseConnections(t *testing.T) {
 		t.Error("In-use connection should NOT be closed by pool.Close()")
 	}
 
-	// Returning the in-use connection to the closed pool should close it
+	// Returning the in-use connection to the closed pool should close it and
+	// return a POOL_CLOSED error (L-6: callers can distinguish pool-closed
+	// from normal return-to-pool).
 	err := wrapped.Close()
-	if err != nil {
-		t.Errorf("Close on returned wrapper should not error: %v", err)
+	if err == nil {
+		t.Error("Close on wrapper returned to closed pool should return POOL_CLOSED error")
 	}
 	if !inUse.IsClosed() {
 		t.Error("In-use connection should be closed after release to closed pool")

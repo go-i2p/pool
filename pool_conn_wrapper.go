@@ -1,6 +1,7 @@
 package pool
 
 import (
+	"errors"
 	"net"
 	"sync"
 
@@ -19,11 +20,10 @@ type PoolConnWrapper struct {
 
 // Close returns the connection to the pool instead of closing it.
 // Returns an error on double-close or if the underlying connection close fails.
-// If Release fails internally (e.g., CONNECTION_NOT_FOUND due to stale pool
-// state), the underlying connection is closed defensively, the Release error
-// is logged at WARN level, and nil is returned — because from the caller's
-// perspective the connection is gone (AUDIT L5 fix). A non-nil error is
-// returned only when the underlying w.Conn.Close() itself fails.
+// If Release fails with a POOL_CLOSED error, the connection was already closed
+// inside Release; Close returns that error without calling Close() again (L-4).
+// For any other Release failure, the connection is closed defensively and the
+// error from w.Conn.Close() is returned.
 func (w *PoolConnWrapper) Close() error {
 	w.mu.Lock()
 	defer w.mu.Unlock()
@@ -35,9 +35,18 @@ func (w *PoolConnWrapper) Close() error {
 	}
 	w.closed = true
 	if err := w.pool.Release(w.addr, w.Conn); err != nil {
-		// Release failed — defensively close the underlying connection to
-		// prevent resource leaks, log the pool-state anomaly, and return nil
-		// so callers using `defer conn.Close()` don't see spurious errors.
+		// Check whether the pool was closed and already closed the connection
+		// inside Release. If so, calling Close() again would double-close the
+		// underlying net.Conn (L-4). We return the POOL_CLOSED error directly.
+		var oopsErr oops.OopsError
+		if errors.As(err, &oopsErr) && oopsErr.Code() == "POOL_CLOSED" {
+			log.WithFields(logger.Fields{
+				"pkg": "pool", "func": "PoolConnWrapper.Close",
+			}).Debug("Pool closed; connection already closed by Release")
+			return err
+		}
+		// Other Release failure — defensively close the underlying connection
+		// to prevent resource leaks and log the pool-state anomaly.
 		log.WithFields(logger.Fields{
 			"pkg": "pool", "func": "PoolConnWrapper.Close",
 		}).Warnf("Release failed (pool state anomaly): %v", err)

@@ -49,12 +49,6 @@ func main() {
     conn.Write([]byte("GET / HTTP/1.0\r\n\r\n"))
 }
 ```
-        panic(err)
-    }
-    // Connection automatically returned to pool when closed
-    defer conn.Close()
-}
-```
 
 ## GetOrDial Pattern (Recommended for NTCP2)
 
