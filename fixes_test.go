@@ -1,11 +1,14 @@
 package pool
 
 import (
+	"context"
 	"errors"
 	"net"
+	"runtime"
 	"strings"
 	"sync"
 	"testing"
+	"time"
 )
 
 // --- Double-release vulnerability tests ---
@@ -299,5 +302,103 @@ func TestClose_MixedErrors(t *testing.T) {
 	}
 	if !errors.Is(closeErr, expectedErr) {
 		t.Errorf("expected error to contain %v, got: %v", expectedErr, closeErr)
+	}
+}
+
+// --- AUDIT M6: health-check goroutine leak tests ---
+
+// blockingConn wraps mockConn and blocks on Read until Close is called.
+// This simulates a connection whose health check performs blocking I/O
+// (e.g., a Noise ping/pong probe that waits for a response).
+type blockingConn struct {
+	mockConn
+	once   sync.Once
+	readCh chan struct{}
+}
+
+func newBlockingConn(addr string) *blockingConn {
+	return &blockingConn{
+		mockConn: *newMockConn(addr),
+		readCh:   make(chan struct{}),
+	}
+}
+
+func (b *blockingConn) Read(p []byte) (int, error) {
+	<-b.readCh
+	return 0, net.ErrClosed
+}
+
+func (b *blockingConn) Close() error {
+	b.once.Do(func() { close(b.readCh) })
+	return b.mockConn.Close()
+}
+
+// TestGetWithContext_SlowHealthCheck_ReturnsPromptlyOnCancel verifies that
+// cancelling ctx while a blocking health check is running causes
+// GetWithContext to return promptly (AUDIT M6 fix: close candidate connection
+// to interrupt health-check I/O rather than blocking on <-healthResult).
+func TestGetWithContext_SlowHealthCheck_ReturnsPromptlyOnCancel(t *testing.T) {
+	healthStarted := make(chan struct{}, 1)
+
+	p := NewConnPool(&PoolConfig{
+		MaxSize: 5,
+		MaxAge:  time.Hour,
+		MaxIdle: time.Hour,
+		HealthCheck: func(c net.Conn) bool {
+			// Signal that the health check has started.
+			select {
+			case healthStarted <- struct{}{}:
+			default:
+			}
+			// Block on network I/O — unblocks when c.Close() is called.
+			var buf [1]byte
+			c.Read(buf[:]) //nolint:errcheck
+			return false
+		},
+	})
+	defer p.Close()
+
+	const addr = "10.9.9.9:9999"
+	goroutinesBefore := runtime.NumGoroutine()
+
+	conn := newBlockingConn(addr)
+	if err := p.Put(conn); err != nil {
+		t.Fatalf("Put: %v", err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	// Run GetWithContext concurrently so we can cancel at the right moment.
+	result := make(chan net.Conn, 1)
+	go func() {
+		result <- p.GetWithContext(ctx, addr)
+	}()
+
+	// Wait for the health-check goroutine to start before cancelling context.
+	select {
+	case <-healthStarted:
+	case <-time.After(2 * time.Second):
+		t.Fatal("health check never started")
+	}
+	cancel()
+
+	// M6: GetWithContext must return promptly after context is cancelled.
+	select {
+	case got := <-result:
+		if got != nil {
+			got.Close()
+		}
+	case <-time.After(500 * time.Millisecond):
+		t.Fatal("GetWithContext did not return within 500ms after context cancellation (M6: goroutine leak)")
+	}
+
+	// Allow health-check goroutine to exit fully.
+	time.Sleep(50 * time.Millisecond)
+	runtime.GC()
+	goroutinesAfter := runtime.NumGoroutine()
+	if goroutinesAfter > goroutinesBefore+2 {
+		t.Errorf("goroutines leaked after context cancellation: before=%d after=%d",
+			goroutinesBefore, goroutinesAfter)
 	}
 }

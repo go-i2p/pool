@@ -1152,8 +1152,10 @@ func TestCleanup_TickerFiresThenClosed(t *testing.T) {
 	// No data race or panic means the test passed
 }
 
-// TestGetWithContext_CancellationDuringHealthCheck validates AUDIT M-1 fix:
-// GetWithContext respects context cancellation during health check execution.
+// TestGetWithContext_CancellationDuringHealthCheck validates AUDIT M-1 + M6 fix:
+// GetWithContext respects context cancellation during health check execution,
+// and the candidate connection is closed and removed from the pool (not returned)
+// so that goroutines don't block indefinitely (AUDIT M6).
 func TestGetWithContext_CancellationDuringHealthCheck(t *testing.T) {
 	// Create a channel to block the health check
 	healthCheckBlocked := make(chan struct{})
@@ -1193,7 +1195,7 @@ func TestGetWithContext_CancellationDuringHealthCheck(t *testing.T) {
 	// Wait for context to timeout
 	<-ctx.Done()
 
-	// Unblock health check
+	// Unblock health check (so the goroutine can exit and GetWithContext can return)
 	close(healthCheckBlocked)
 
 	// GetWithContext should return nil due to context cancellation
@@ -1202,10 +1204,12 @@ func TestGetWithContext_CancellationDuringHealthCheck(t *testing.T) {
 		t.Error("Expected nil due to context cancellation, got connection")
 	}
 
-	// Verify connection is back in pool and usable
+	// M6 fix: connection is closed and removed from the pool on context cancellation
+	// (candidate.conn.Close() is called to interrupt health-check I/O, so the
+	// connection cannot be reused and is removed rather than returned).
 	stats := pool.Stats()
-	if stats["available"] != 1 {
-		t.Errorf("Expected 1 available connection, got %d", stats["available"])
+	if stats["available"] != 0 {
+		t.Errorf("Expected 0 available connections after M6-fix cancellation, got %d", stats["available"])
 	}
 }
 

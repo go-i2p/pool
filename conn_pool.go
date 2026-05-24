@@ -336,19 +336,21 @@ func (p *ConnPool) GetWithContext(ctx context.Context, remoteAddr string) net.Co
 			case healthy = <-healthResult:
 				// Health check completed
 			case <-ctx.Done():
-				// Context cancelled during health check (AUDIT H2 fix).
-				// We cannot return the candidate to the pool while the
-				// health-check goroutine is still doing I/O on the connection
-				// — that would create a data race. Wait for the goroutine to
-				// complete (buffered channel, never blocks us once it finishes),
-				// then return the candidate to the pool with inUse=false.
+				// Context cancelled during health check (AUDIT H2 + M6 fix).
+				// Close the candidate connection to interrupt any blocking I/O
+				// inside the health-check goroutine, so the goroutine unblocks
+				// and the buffered channel drains quickly (AUDIT M6: prevents
+				// indefinite goroutine accumulation when health checks block).
+				// After draining we remove the connection from the pool (it is
+				// now closed and cannot be reused).
 				log.WithFields(logger.Fields{
 					"pkg": "pool", "func": "ConnPool.GetWithContext",
 					"remote_addr": candidate.remoteAddr,
-				}).Debug("Context cancelled during health check; waiting for goroutine before releasing candidate")
-				<-healthResult // drain — no concurrent I/O after this point
+				}).Debug("Context cancelled during health check; closing candidate to unblock goroutine")
+				candidate.conn.Close() // interrupt blocking health-check I/O
+				<-healthResult         // drain — goroutine exits quickly now
 				p.mu.Lock()
-				candidate.inUse = false
+				p.removeConnLocked(remoteAddr, candidate.conn)
 				p.mu.Unlock()
 				return nil
 			}
