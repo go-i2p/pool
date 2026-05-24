@@ -38,8 +38,8 @@ func TestDrain_WaitsForInUseConnections(t *testing.T) {
 	f.checkout(t)
 
 	stats := f.pool.Stats()
-	if stats["in_use"] != 1 {
-		t.Fatalf("expected 1 in_use, got %d", stats["in_use"])
+	if stats.InUse != 1 {
+		t.Fatalf("expected 1 in_use, got %d", stats.InUse)
 	}
 
 	// Release after a short delay in a goroutine.
@@ -97,8 +97,8 @@ func TestDrain_MultipleInUseConnections(t *testing.T) {
 	}
 
 	stats := pool.Stats()
-	if stats["in_use"] != 3 {
-		t.Fatalf("expected 3 in_use, got %d", stats["in_use"])
+	if stats.InUse != 3 {
+		t.Fatalf("expected 3 in_use, got %d", stats.InUse)
 	}
 
 	// Release connections one at a time with staggered delays.
@@ -121,8 +121,8 @@ func TestDrain_MultipleInUseConnections(t *testing.T) {
 	wg.Wait()
 
 	stats = pool.Stats()
-	if stats["in_use"] != 0 {
-		t.Fatalf("expected 0 in_use after Drain, got %d", stats["in_use"])
+	if stats.InUse != 0 {
+		t.Fatalf("expected 0 in_use after Drain, got %d", stats.InUse)
 	}
 }
 
@@ -134,8 +134,8 @@ func TestClose_PreservesInUseForDrain(t *testing.T) {
 
 	// Stats should still show 1 in-use.
 	stats := f.pool.Stats()
-	if stats["in_use"] != 1 {
-		t.Errorf("expected 1 in_use after Close(), got %d", stats["in_use"])
+	if stats.InUse != 1 {
+		t.Errorf("expected 1 in_use after Close(), got %d", stats.InUse)
 	}
 
 	// Drain should wait for the in-use connection.
@@ -152,8 +152,8 @@ func TestClose_PreservesInUseForDrain(t *testing.T) {
 	}
 
 	stats = f.pool.Stats()
-	if stats["in_use"] != 0 {
-		t.Errorf("expected 0 in_use after Drain, got %d", stats["in_use"])
+	if stats.InUse != 0 {
+		t.Errorf("expected 0 in_use after Drain, got %d", stats.InUse)
 	}
 }
 

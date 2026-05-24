@@ -61,11 +61,11 @@ func TestGetOrDial_DialsWhenEmpty(t *testing.T) {
 
 	// The returned connection should be checked out (in use).
 	stats := pool.Stats()
-	if stats["total"] != 1 {
-		t.Errorf("expected total=1, got %d", stats["total"])
+	if stats.Total != 1 {
+		t.Errorf("expected total=1, got %d", stats.Total)
 	}
-	if stats["in_use"] != 1 {
-		t.Errorf("expected in_use=1, got %d", stats["in_use"])
+	if stats.InUse != 1 {
+		t.Errorf("expected in_use=1, got %d", stats.InUse)
 	}
 }
 
@@ -289,8 +289,8 @@ func TestPut_ReadyCheckPasses(t *testing.T) {
 	}
 
 	stats := pool.Stats()
-	if stats["total"] != 1 {
-		t.Errorf("expected total=1, got %d", stats["total"])
+	if stats.Total != 1 {
+		t.Errorf("expected total=1, got %d", stats.Total)
 	}
 }
 
@@ -315,8 +315,8 @@ func TestPut_ReadyCheckFails(t *testing.T) {
 	}
 
 	stats := pool.Stats()
-	if stats["total"] != 0 {
-		t.Errorf("expected total=0 (connection rejected), got %d", stats["total"])
+	if stats.Total != 0 {
+		t.Errorf("expected total=0 (connection rejected), got %d", stats.Total)
 	}
 }
 
@@ -432,8 +432,8 @@ func TestDialMu_PersistsAfterCleanup(t *testing.T) {
 
 	// Verify connections are removed
 	stats := pool.Stats()
-	if stats["total"] != 0 {
-		t.Errorf("Expected 0 connections after cleanup, got %d", stats["total"])
+	if stats.Total != 0 {
+		t.Errorf("Expected 0 connections after cleanup, got %d", stats.Total)
 	}
 
 	// dialMu entries must persist after cleanup to prevent TOCTOU races (AUDIT H3 fix)
@@ -530,7 +530,7 @@ func TestGetOrDial_DialReturnsConnAndError(t *testing.T) {
 
 	// Verify no connection was added to pool
 	stats := pool.Stats()
-	if stats["total"] != 0 {
-		t.Errorf("Expected 0 connections after invalid dial result, got %d", stats["total"])
+	if stats.Total != 0 {
+		t.Errorf("Expected 0 connections after invalid dial result, got %d", stats.Total)
 	}
 }

@@ -38,3 +38,7 @@ type PooledConn struct {
 // now returns []ConnSnapshot which carries no live net.Conn handle. Do not
 // call Close(), Write(), or Read() on this value from external code.
 func (p *PooledConn) NetConn() net.Conn { return p.conn }
+
+// ConnEntry is an alias for PooledConn following Go naming conventions.
+// Prefer ConnEntry in new code; PooledConn is retained for backward compatibility.
+type ConnEntry = PooledConn

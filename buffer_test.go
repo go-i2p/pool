@@ -200,8 +200,8 @@ func TestConnPool_MaxSize(t *testing.T) {
 
 	// Should only have one connection available
 	stats := pool.Stats()
-	if stats["total"] != 1 {
-		t.Errorf("Expected 1 total connection, got %d", stats["total"])
+	if stats.Total != 1 {
+		t.Errorf("Expected 1 total connection, got %d", stats.Total)
 	}
 
 	// Verify conn2 was closed due to max size limit
@@ -235,17 +235,17 @@ func TestConnPool_Stats(t *testing.T) {
 	expectedAvailable := 1
 	expectedAddresses := 2
 
-	if stats["total"] != expectedTotal {
-		t.Errorf("Expected total %d, got %d", expectedTotal, stats["total"])
+	if stats.Total != expectedTotal {
+		t.Errorf("Expected total %d, got %d", expectedTotal, stats.Total)
 	}
-	if stats["in_use"] != expectedInUse {
-		t.Errorf("Expected in_use %d, got %d", expectedInUse, stats["in_use"])
+	if stats.InUse != expectedInUse {
+		t.Errorf("Expected in_use %d, got %d", expectedInUse, stats.InUse)
 	}
-	if stats["available"] != expectedAvailable {
-		t.Errorf("Expected available %d, got %d", expectedAvailable, stats["available"])
+	if stats.Available != expectedAvailable {
+		t.Errorf("Expected available %d, got %d", expectedAvailable, stats.Available)
 	}
-	if stats["addresses"] != expectedAddresses {
-		t.Errorf("Expected addresses %d, got %d", expectedAddresses, stats["addresses"])
+	if stats.Addresses != expectedAddresses {
+		t.Errorf("Expected addresses %d, got %d", expectedAddresses, stats.Addresses)
 	}
 }
 
@@ -369,8 +369,8 @@ func TestPerformCleanupCycle_ExpiresOldConnections(t *testing.T) {
 	pool.Put(conn)
 
 	stats := pool.Stats()
-	if stats["total"] != 1 {
-		t.Fatalf("Expected 1 connection, got %d", stats["total"])
+	if stats.Total != 1 {
+		t.Fatalf("Expected 1 connection, got %d", stats.Total)
 	}
 
 	time.Sleep(100 * time.Millisecond)
@@ -378,8 +378,8 @@ func TestPerformCleanupCycle_ExpiresOldConnections(t *testing.T) {
 	pool.performCleanupCycle()
 
 	stats = pool.Stats()
-	if stats["total"] != 0 {
-		t.Errorf("Expected 0 connections after cleanup, got %d", stats["total"])
+	if stats.Total != 0 {
+		t.Errorf("Expected 0 connections after cleanup, got %d", stats.Total)
 	}
 
 	if !conn.IsClosed() {
@@ -404,8 +404,8 @@ func TestPerformCleanupCycle_KeepsInUseConnections(t *testing.T) {
 	pool.performCleanupCycle()
 
 	stats := pool.Stats()
-	if stats["total"] != 1 {
-		t.Errorf("In-use connection should survive cleanup, got total=%d", stats["total"])
+	if stats.Total != 1 {
+		t.Errorf("In-use connection should survive cleanup, got total=%d", stats.Total)
 	}
 }
 
@@ -589,8 +589,8 @@ func TestPoolConnWrapper_Discard(t *testing.T) {
 	}
 
 	stats := pool.Stats()
-	if stats["total"] != 0 {
-		t.Errorf("Pool should be empty after discard, got total=%d", stats["total"])
+	if stats.Total != 0 {
+		t.Errorf("Pool should be empty after discard, got total=%d", stats.Total)
 	}
 }
 
@@ -647,8 +647,8 @@ func TestPut_DuplicateConnection(t *testing.T) {
 	pool.Put(conn) // duplicate
 
 	stats := pool.Stats()
-	if stats["total"] != 1 {
-		t.Errorf("Duplicate Put should not create a second entry, got total=%d", stats["total"])
+	if stats.Total != 1 {
+		t.Errorf("Duplicate Put should not create a second entry, got total=%d", stats.Total)
 	}
 }
 
@@ -683,8 +683,8 @@ func TestPut_UnwrapsPoolConnWrapper(t *testing.T) {
 
 	// After proper release, pool should still have 1 connection.
 	stats := pool.Stats()
-	if stats["total"] != 1 {
-		t.Errorf("Expected 1 after proper release, got total=%d", stats["total"])
+	if stats.Total != 1 {
+		t.Errorf("Expected 1 after proper release, got total=%d", stats.Total)
 	}
 }
 
@@ -706,8 +706,8 @@ func TestMaxTotal_EnforcesGlobalLimit(t *testing.T) {
 	pool.Put(conn3) // exceeds MaxTotal
 
 	stats := pool.Stats()
-	if stats["total"] != 2 {
-		t.Errorf("Expected 2 connections (MaxTotal=2), got total=%d", stats["total"])
+	if stats.Total != 2 {
+		t.Errorf("Expected 2 connections (MaxTotal=2), got total=%d", stats.Total)
 	}
 	if !conn3.IsClosed() {
 		t.Error("Third connection should be closed due to MaxTotal limit")
@@ -740,8 +740,8 @@ func TestHealthCheck_RejectsUnhealthyConnections(t *testing.T) {
 	}
 
 	stats := pool.Stats()
-	if stats["total"] != 0 {
-		t.Errorf("Pool should be empty after unhealthy conn removed, got total=%d", stats["total"])
+	if stats.Total != 0 {
+		t.Errorf("Pool should be empty after unhealthy conn removed, got total=%d", stats.Total)
 	}
 }
 
@@ -790,8 +790,8 @@ func TestGet_RemovesExpiredConnections(t *testing.T) {
 		t.Fatalf("Put fresh conn after expiry purge failed: %v", err)
 	}
 	stats := p.Stats()
-	if stats["total"] != 1 {
-		t.Errorf("Expected 1 fresh connection after expiry purge, got total=%d", stats["total"])
+	if stats.Total != 1 {
+		t.Errorf("Expected 1 fresh connection after expiry purge, got total=%d", stats.Total)
 	}
 }
 
@@ -818,8 +818,8 @@ func TestMaxSizeZero_TreatedAsNoLimit(t *testing.T) {
 	}
 
 	stats := p.Stats()
-	if stats["total"] != n {
-		t.Errorf("Expected %d connections with MaxSize=0 no-limit, got total=%d", n, stats["total"])
+	if stats.Total != n {
+		t.Errorf("Expected %d connections with MaxSize=0 no-limit, got total=%d", n, stats.Total)
 	}
 }
 
@@ -891,8 +891,8 @@ func TestConcurrency_PutGetRelease(t *testing.T) {
 
 	// Basic sanity: total count must be non-negative.
 	stats := p.Stats()
-	if stats["total"] < 0 {
-		t.Errorf("pool total went negative: %d", stats["total"])
+	if stats.Total < 0 {
+		t.Errorf("pool total went negative: %d", stats.Total)
 	}
 }
 
@@ -960,8 +960,8 @@ func TestRemove_ConnectionNotInList(t *testing.T) {
 
 	// conn1 should still be in the pool.
 	stats := p.Stats()
-	if stats["total"] != 1 {
-		t.Errorf("expected 1 connection still in pool, got %d", stats["total"])
+	if stats.Total != 1 {
+		t.Errorf("expected 1 connection still in pool, got %d", stats.Total)
 	}
 }
 
@@ -1042,8 +1042,8 @@ func TestCleanup_TickerFires(t *testing.T) {
 	}
 
 	stats := p.Stats()
-	if stats["total"] != 1 {
-		t.Fatalf("expected 1 connection, got %d", stats["total"])
+	if stats.Total != 1 {
+		t.Fatalf("expected 1 connection, got %d", stats.Total)
 	}
 
 	// Wait long enough for the cleanup interval (min 1s) to fire
@@ -1051,8 +1051,8 @@ func TestCleanup_TickerFires(t *testing.T) {
 	time.Sleep(2 * time.Second)
 
 	stats = p.Stats()
-	if stats["total"] != 0 {
-		t.Errorf("expected 0 connections after cleanup ticker fired, got %d", stats["total"])
+	if stats.Total != 0 {
+		t.Errorf("expected 0 connections after cleanup ticker fired, got %d", stats.Total)
 	}
 	if !conn.IsClosed() {
 		t.Error("expired connection should have been closed by cleanup goroutine")
@@ -1212,8 +1212,8 @@ func TestGetWithContext_CancellationDuringHealthCheck(t *testing.T) {
 	// (candidate.conn.Close() is called to interrupt health-check I/O, so the
 	// connection cannot be reused and is removed rather than returned).
 	stats := pool.Stats()
-	if stats["available"] != 0 {
-		t.Errorf("Expected 0 available connections after M6-fix cancellation, got %d", stats["available"])
+	if stats.Available != 0 {
+		t.Errorf("Expected 0 available connections after M6-fix cancellation, got %d", stats.Available)
 	}
 }
 
@@ -1245,8 +1245,8 @@ func TestGetWithContext_HealthCheckPasses(t *testing.T) {
 
 	// Verify connection is in use
 	stats := pool.Stats()
-	if stats["in_use"] != 1 {
-		t.Errorf("Expected 1 in_use connection, got %d", stats["in_use"])
+	if stats.InUse != 1 {
+		t.Errorf("Expected 1 in_use connection, got %d", stats.InUse)
 	}
 }
 
@@ -1278,8 +1278,8 @@ func TestGetWithContext_ContextAlreadyCancelled(t *testing.T) {
 
 	// Verify connection is still available
 	stats := pool.Stats()
-	if stats["available"] != 1 {
-		t.Errorf("Expected 1 available connection, got %d", stats["available"])
+	if stats.Available != 1 {
+		t.Errorf("Expected 1 available connection, got %d", stats.Available)
 	}
 }
 
@@ -1311,8 +1311,8 @@ func TestGetWithContext_HealthCheckPanics(t *testing.T) {
 
 	// Verify connection is removed from pool
 	stats := pool.Stats()
-	if stats["total"] != 0 {
-		t.Errorf("Expected 0 connections after panic, got %d", stats["total"])
+	if stats.Total != 0 {
+		t.Errorf("Expected 0 connections after panic, got %d", stats.Total)
 	}
 }
 

@@ -82,3 +82,7 @@ func (w *PoolConnWrapper) Discard() error {
 	w.closed = true
 	return w.pool.Remove(w.addr, w.Conn)
 }
+
+// ConnWrapper is an alias for PoolConnWrapper following Go naming conventions.
+// Prefer ConnWrapper in new code; PoolConnWrapper is retained for backward compatibility.
+type ConnWrapper = PoolConnWrapper

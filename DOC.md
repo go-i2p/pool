@@ -1,6 +1,6 @@
 # pool
 --
-    import "github.com/go-i2p/go-noise/pool"
+    import "github.com/go-i2p/pool"
 
 
 
