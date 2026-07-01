@@ -3,7 +3,7 @@ module github.com/go-i2p/pool
 go 1.26.3
 
 require (
-	github.com/go-i2p/logger v0.1.60000-0.20260701131042-844a6cd1489b
+	github.com/go-i2p/logger v0.1.60000-0.20260701134448-2648c3b0e040
 	github.com/samber/oops v1.22.0
 )
 
