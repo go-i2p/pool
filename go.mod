@@ -1,6 +1,6 @@
 module github.com/go-i2p/pool
 
-go 1.26.3
+go 1.26.8
 
 require (
 	github.com/go-i2p/logger v0.1.60000-0.20260701134448-2648c3b0e040
